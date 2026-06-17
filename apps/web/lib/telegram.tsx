@@ -87,6 +87,11 @@ declare global {
           };
           start_param?: string;
         };
+        // Navigation
+        openLink: (url: string, options?: { try_instant_view?: boolean }) => void;
+        openTelegramLink: (url: string) => void;
+        switchInlineQuery: (query: string, choose_chat_types?: string[]) => void;
+        // Main & Back buttons
         MainButton: {
           text: string;
           show: () => void;
@@ -99,12 +104,39 @@ declare global {
           hide: () => void;
           onClick: (cb: () => void) => void;
         };
+        // Haptic
         HapticFeedback: {
           impactOccurred: (style: 'light' | 'medium' | 'heavy' | 'rigid' | 'soft') => void;
           notificationOccurred: (type: 'error' | 'success' | 'warning') => void;
+          selectionChanged: () => void;
         };
+        // Clipboard
+        readTextFromClipboard: (callback: (text: string) => void) => void;
+        // Theme & display
         colorScheme: 'light' | 'dark';
         themeParams: Record<string, string>;
+        isExpanded: boolean;
+        viewportHeight: number;
+        viewportStableHeight: number;
+        // Popups
+        showPopup: (params: {
+          title?: string;
+          message: string;
+          buttons?: Array<{ id?: string; type?: string; text?: string }>;
+        }, callback?: (buttonId: string) => void) => void;
+        showAlert: (message: string, callback?: () => void) => void;
+        showConfirm: (message: string, callback?: (confirmed: boolean) => void) => void;
+        // Invoice
+        openInvoice: (url: string, callback?: (status: string) => void) => void;
+        // QR
+        showScanQrPopup: (params: { text?: string }, callback?: (text: string) => boolean) => void;
+        closeScanQrPopup: () => void;
+        // Events
+        onEvent: (eventType: string, eventHandler: () => void) => void;
+        offEvent: (eventType: string, eventHandler: () => void) => void;
+        sendData: (data: string) => void;
+        version: string;
+        platform: string;
       };
     };
   }
