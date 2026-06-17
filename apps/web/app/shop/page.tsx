@@ -1,0 +1,160 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import { ShoppingBag, Lock, Check, Coins } from 'lucide-react';
+import { useApi, type AiModule } from '@/lib/api';
+import { useGameStore } from '@/lib/store';
+import { BottomNav } from '@/components/BottomNav';
+import { hapticNotification, formatNumber, cn } from '@/lib/utils';
+
+export default function ShopPage() {
+  const api = useApi();
+  const { user, spendCoins, setUser, modules, setModules } = useGameStore();
+  const [loading, setLoading] = useState(true);
+  const [buying, setBuying] = useState<number | null>(null);
+  
+  useEffect(() => {
+    api.get<{ modules: AiModule[] }>('/api/modules')
+      .then((res) => setModules(res.modules))
+      .catch(console.error)
+      .finally(() => setLoading(false));
+  }, []);
+  
+  const handleBuy = async (module: AiModule) => {
+    if (!user) return;
+    if (user.ai_level < module.minAiLevel) {
+      hapticNotification('error');
+      alert(`Your AI must be level ${module.minAiLevel}`);
+      return;
+    }
+    if (module.nextLevelCost && user.coin_balance < module.nextLevelCost) {
+      hapticNotification('error');
+      alert('Not enough coins');
+      return;
+    }
+    
+    try {
+      setBuying(module.id);
+      const response = await api.post<{ newBalance: number }>('/api/modules/buy', { moduleId: module.id });
+      spendCoins(module.nextLevelCost || module.baseCost);
+      setUser({ ...user, coin_balance: response.newBalance });
+      hapticNotification('success');
+      
+      // Refresh modules
+      const refreshed = await api.get<{ modules: AiModule[] }>('/api/modules');
+      setModules(refreshed.modules);
+    } catch (err: any) {
+      hapticNotification('error');
+      alert(err.message);
+    } finally {
+      setBuying(null);
+    }
+  };
+  
+  const groupedModules = modules.reduce((acc, m) => {
+    if (!acc[m.category]) acc[m.category] = [];
+    acc[m.category].push(m);
+    return acc;
+  }, {} as Record<string, AiModule[]>);
+  
+  const categoryNames: Record<string, { name: string; icon: string; color: string }> = {
+    compute: { name: 'Compute', icon: '⚡', color: 'text-yellow-400' },
+    specialty: { name: 'Specialties', icon: '🧠', color: 'text-accent-400' },
+    dataset: { name: 'Datasets', icon: '📚', color: 'text-blue-400' },
+    algorithm: { name: 'Algorithms', icon: '⚙️', color: 'text-green-400' },
+  };
+  
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center pb-20">
+        <ShoppingBag className="w-12 h-12 text-accent-500 animate-pulse" />
+      </div>
+    );
+  }
+  
+  return (
+    <div className="min-h-screen pb-20 px-4 pt-6">
+      <h1 className="text-2xl font-bold mb-1">AI Shop</h1>
+      <p className="text-dark-300 text-sm mb-6">Upgrade your AI to earn more</p>
+      
+      {Object.entries(groupedModules).map(([category, mods]) => {
+        const cat = categoryNames[category] || { name: category, icon: '📦', color: 'text-white' };
+        return (
+          <div key={category} className="mb-6">
+            <h2 className="text-lg font-semibold mb-3 flex items-center gap-2">
+              <span className="text-2xl">{cat.icon}</span>
+              <span className={cat.color}>{cat.name}</span>
+            </h2>
+            
+            <div className="space-y-3">
+              {mods.map((mod) => {
+                const canAfford = user && mod.nextLevelCost !== null && user.coin_balance >= mod.nextLevelCost;
+                const meetsLevel = user && user.ai_level >= mod.minAiLevel;
+                const canBuy = canAfford && meetsLevel && !mod.isMaxLevel;
+                
+                return (
+                  <div
+                    key={mod.id}
+                    className={cn(
+                      "card transition-all",
+                      mod.isMaxLevel ? "opacity-60" : "",
+                      !meetsLevel ? "opacity-50" : ""
+                    )}
+                  >
+                    <div className="flex items-start justify-between">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <h3 className="font-semibold">{mod.name}</h3>
+                          {mod.currentLevel > 0 && (
+                            <span className="text-xs px-2 py-0.5 rounded-full bg-accent-500/20 text-accent-400">
+                              Lvl {mod.currentLevel}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-sm text-dark-300 mt-1">{mod.description}</p>
+                        <div className="flex items-center gap-3 mt-2 text-xs">
+                          {mod.coinsPerHourBonus > 0 && (
+                            <span className="text-green-400">+{formatNumber(mod.coinsPerHourBonus * mod.currentLevel)}/h</span>
+                          )}
+                          {!meetsLevel && (
+                            <span className="text-orange-400">⚠️ Requires AI Lvl {mod.minAiLevel}</span>
+                          )}
+                        </div>
+                      </div>
+                      
+                      {mod.isMaxLevel ? (
+                        <Check className="w-6 h-6 text-green-400" />
+                      ) : !meetsLevel ? (
+                        <Lock className="w-5 h-5 text-dark-300" />
+                      ) : (
+                        <button
+                          onClick={() => handleBuy(mod)}
+                          disabled={!canBuy || buying === mod.id}
+                          className={cn(
+                            "px-4 py-2 rounded-xl font-semibold transition-all",
+                            canBuy
+                              ? "bg-accent-500 hover:bg-accent-600 text-white active:scale-95"
+                              : "bg-dark-700 text-dark-300"
+                          )}
+                        >
+                          {buying === mod.id ? '...' : (
+                            <span className="flex items-center gap-1">
+                              <Coins className="w-4 h-4" />
+                              {formatNumber(mod.nextLevelCost || 0)}
+                            </span>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+      
+      <BottomNav />
+    </div>
+  );
+}

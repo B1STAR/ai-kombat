@@ -1,0 +1,30 @@
+{
+  "name": "ai-kombat",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Kombat - A Telegram Mini App tap-to-earn game on the theme of AI",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run --filter '*' dev",
+    "dev:web": "bun run --filter web dev",
+    "dev:api": "bun run --filter api dev",
+    "build": "bun run --filter '*' build",
+    "lint": "bun run --filter '*' lint",
+    "db:migrate": "cd apps/api && bun run db:migrate",
+    "db:seed": "cd apps/api && bun run db:seed",
+    "db:reset": "cd apps/api && bun run db:reset",
+    "typecheck": "bun run --filter '*' typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=20",
+    "bun": ">=1.0.0"
+  }
+}
