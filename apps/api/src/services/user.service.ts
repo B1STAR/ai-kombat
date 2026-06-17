@@ -1,7 +1,14 @@
 /**
  * User service: business logic for user creation, balance updates, etc.
+ *
+ * AUDIT FIX (2026-06-17) — Bug #4:
+ * spendCoins() rewritten as a single atomic UPDATE ... WHERE coin_balance >= amount.
+ * Eliminates the TOCTOU window between the balance check and the decrement that
+ * existed in the previous read → check → update pattern.
+ * Returns null if the balance is insufficient (no throw — caller decides the error).
  */
 import { db } from '../db/knex';
+import type { Knex } from 'knex';
 import type { InitDataParsed } from '@telegram-apps/init-data-node';
 
 export interface User {
@@ -37,7 +44,7 @@ export interface User {
 
 export const upsertUser = async (parsed: InitDataParsed): Promise<User> => {
   if (!parsed.user) throw new Error('No user in initData');
-  
+
   const [user] = await db<User>('users')
     .insert({
       telegram_id: parsed.user.id,
@@ -52,7 +59,7 @@ export const upsertUser = async (parsed: InitDataParsed): Promise<User> => {
     .onConflict('telegram_id')
     .merge(['first_name', 'last_name', 'username', 'photo_url', 'is_premium', 'language_code', 'last_active_at'])
     .returning('*');
-  
+
   return user;
 };
 
@@ -65,18 +72,26 @@ export const calculateValidEnergy = (user: User, now: Date = new Date()): number
   const lastUpdate = new Date(user.last_energy_update);
   const secondsPassed = Math.floor((now.getTime() - lastUpdate.getTime()) / 1000);
   const regenPerSecond = 1; // 1 energy / sec (configurable)
-  const newEnergy = user.energy + (secondsPassed * regenPerSecond);
+  const newEnergy = user.energy + secondsPassed * regenPerSecond;
   return Math.min(newEnergy, user.max_energy);
 };
 
-export const addCoins = async (userId: number, amount: number, type: string, relatedEntity?: { type: string; id: number }): Promise<number> => {
-  const [updated] = await db<User>('users')
+export const addCoins = async (
+  userId: number,
+  amount: number,
+  type: string,
+  relatedEntity?: { type: string; id: number },
+  trx?: Knex.Transaction,
+): Promise<number> => {
+  const query = (trx || db)<User>('users')
     .where({ telegram_id: userId })
     .increment('coin_balance', amount)
     .increment('total_earned_coins', amount > 0 ? amount : 0)
     .returning('coin_balance');
-  
-  await db('transactions').insert({
+
+  const [updated] = await query;
+
+  await (trx || db)('transactions').insert({
     user_id: userId,
     type,
     currency: 'coin',
@@ -85,51 +100,81 @@ export const addCoins = async (userId: number, amount: number, type: string, rel
     related_entity_type: relatedEntity?.type || null,
     related_entity_id: relatedEntity?.id || null,
   });
-  
+
   return updated.coin_balance;
 };
 
-export const spendCoins = async (userId: number, amount: number, type: string, relatedEntity?: { type: string; id: number }): Promise<number> => {
-  const user = await getUserByTelegramId(userId);
-  if (!user) throw new Error('User not found');
-  if (user.coin_balance < amount) throw new Error('Insufficient coins');
-  
-  const [updated] = await db<User>('users')
+/**
+ * Atomically deduct `amount` coins from the user.
+ *
+ * Uses a single UPDATE ... WHERE coin_balance >= amount to eliminate the
+ * TOCTOU (time-of-check-to-time-of-use) race condition present in the
+ * old read → check → update pattern.
+ *
+ * @returns The new coin_balance, or null if the balance was insufficient
+ *          (no rows updated). Caller is responsible for throwing an error.
+ */
+export const spendCoins = async (
+  userId: number,
+  amount: number,
+  type: string,
+  relatedEntity?: { type: string; id: number },
+  trx?: Knex.Transaction,
+): Promise<number | null> => {
+  // Single atomic operation: deduct ONLY IF the current balance is sufficient.
+  // If coin_balance < amount, the WHERE clause matches zero rows → no update.
+  const rows = await (trx || db)<User>('users')
     .where({ telegram_id: userId })
+    .where('coin_balance', '>=', amount)
     .decrement('coin_balance', amount)
     .returning('coin_balance');
-  
-  await db('transactions').insert({
+
+  if (rows.length === 0) {
+    // Balance was insufficient — no rows updated, no money moved.
+    return null;
+  }
+
+  const newBalance = rows[0].coin_balance;
+
+  await (trx || db)('transactions').insert({
     user_id: userId,
     type,
     currency: 'coin',
     amount: -amount,
-    balance_after: updated.coin_balance,
+    balance_after: newBalance,
     related_entity_type: relatedEntity?.type || null,
     related_entity_id: relatedEntity?.id || null,
   });
-  
-  return updated.coin_balance;
+
+  return newBalance;
 };
 
 export const getUserProgress = async (userId: number) => {
-  // Get active quests
   const activeQuests = await db('user_quests')
     .where({ user_id: userId, is_completed: false })
     .join('quests', 'quests.id', 'user_quests.quest_id')
-    .select('user_quests.*', 'quests.name', 'quests.description', 'quests.reward_coins', 'quests.target_count');
-  
-  // Get owned modules
+    .select(
+      'user_quests.*',
+      'quests.name',
+      'quests.description',
+      'quests.reward_coins',
+      'quests.target_count',
+    );
+
   const ownedModules = await db('user_modules')
     .where({ user_id: userId })
     .join('ai_modules', 'ai_modules.id', 'user_modules.module_id')
-    .select('user_modules.*', 'ai_modules.code', 'ai_modules.name', 'ai_modules.coins_per_hour_bonus');
-  
-  // Get achievements
+    .select(
+      'user_modules.*',
+      'ai_modules.code',
+      'ai_modules.name',
+      'ai_modules.coins_per_hour_bonus',
+    );
+
   const achievements = await db('user_achievements')
     .where({ user_id: userId })
     .join('achievements', 'achievements.id', 'user_achievements.achievement_id')
     .select('user_achievements.*', 'achievements.name', 'achievements.icon_url');
-  
+
   return { activeQuests, ownedModules, achievements };
 };

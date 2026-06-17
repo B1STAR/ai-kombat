@@ -1,6 +1,15 @@
 /**
  * Tap routes: /api/tap/*
  * POST /api/tap - Validate a batch of taps
+ *
+ * AUDIT FIX (2026-06-17):
+ * - Bug #1: Entire route is now inside a db.transaction() with FOR UPDATE
+ *   Prevents race condition where parallel requests overdraft energy.
+ * - Bug #2: Core economic ops (energy + coins) are atomic inside the transaction.
+ *   total_taps / total_earned_coins are updated best-effort OUTSIDE the tx
+ *   (analyst data, acceptable eventual consistency per designer spec).
+ * - Bug #3: Anti-cheat now uses durationMs/count (declared taps/sec) instead
+ *   of server_timestamp stdDev (useless for batched requests).
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -10,8 +19,8 @@ import { rateLimit } from '../middlewares/rateLimit';
 import { detectSuspiciousPattern, logTapEvent } from '../middlewares/antiCheat';
 import { db } from '../db/knex';
 import { addCoins, calculateValidEnergy, getUserByTelegramId } from '../services/user.service';
-import { addXp } from '../services/economy.service';
-import { getPassiveIncomePerHour } from '../services/economy.service';
+import { addXp, getPassiveIncomePerHour } from '../services/economy.service';
+import { NotFoundError, AppError } from '../lib/errors';
 import { logger } from '../lib/logger';
 
 const tap = new Hono();
@@ -19,7 +28,7 @@ const tap = new Hono();
 const tapSchema = z.object({
   count: z.number().int().min(1).max(60),
   clientTimestamp: z.string(), // ISO 8601
-  durationMs: z.number().optional(),
+  durationMs: z.number().min(0).optional(),
 });
 
 tap.post(
@@ -28,77 +37,127 @@ tap.post(
   rateLimit('tap'),
   zValidator('json', tapSchema),
   async (c) => {
-    const user = c.get('telegramUser');
-    const dbUser = c.get('dbUser');
+    const telegramUser = c.get('telegramUser');
     const { count, clientTimestamp, durationMs } = c.req.valid('json');
-    
-    if (!dbUser) {
-      return c.json({ error: 'User not found' }, 404);
-    }
-    
-    // 1. Validate energy
-    const currentEnergy = calculateValidEnergy(dbUser);
-    if (currentEnergy < count) {
-      return c.json({ 
-        error: 'Insufficient energy',
-        energy: currentEnergy,
-        maxEnergy: dbUser.max_energy,
-      }, 400);
-    }
-    
-    // 2. Calculate multiplier from modules
-    const passiveIncome = await getPassiveIncomePerHour(user.id);
-    const multiplier = 1 + Math.floor(passiveIncome / 1000) * 0.1; // +10% per 1000/h
-    
-    // 3. Calculate rewards
-    const baseCoins = count * 1; // 1 coin per tap
-    const coinsEarned = Math.floor(baseCoins * multiplier);
-    const xpGained = count; // 1 XP per tap
-    
-    // 4. Anti-cheat: detect suspicious patterns
-    const { suspicious, reason } = await detectSuspiciousPattern(user.id, {
-      count, clientTimestamp, durationMs,
+
+    // ── Anti-cheat: run BEFORE the transaction (read-only, no perf cost inside tx)
+    const { suspicious, reason } = await detectSuspiciousPattern(telegramUser.id, {
+      count,
+      clientTimestamp,
+      durationMs,
     });
-    
-    // 5. Log the tap event
+
+    // ── Log tap event (best-effort, outside tx — analytics data)
     const ip = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
     const userAgent = c.req.header('user-agent') || 'unknown';
-    await logTapEvent(user.id, { count, clientTimestamp, durationMs }, ip, userAgent, suspicious);
-    
-    // 6. If suspicious, don't credit coins (or credit partial)
-    const finalCoins = suspicious ? 0 : coinsEarned;
-    
-    // 7. Update user state
-    await db('users')
-      .where({ telegram_id: user.id })
-      .update({
-        energy: dbUser.energy - count,
-        last_energy_update: new Date(),
-      })
-      .increment('total_taps', count);
-    
-    if (finalCoins > 0) {
-      await addCoins(user.id, finalCoins, 'tap_earn');
+    // Fire-and-forget: don't await, don't block the response on analytics
+    logTapEvent(telegramUser.id, { count, clientTimestamp, durationMs }, ip, userAgent, suspicious)
+      .catch((err) => logger.error({ err }, 'Failed to log tap event'));
+
+    // If already suspicious, short-circuit — no DB writes needed
+    if (suspicious) {
+      logger.warn({ userId: telegramUser.id, reason }, 'Suspicious tap rejected before tx');
+      // Return a plausible response so client doesn't know it was flagged
+      const currentUser = await getUserByTelegramId(telegramUser.id);
+      if (!currentUser) throw new NotFoundError('User not found');
+      return c.json({
+        coinsEarned: 0,
+        xpGained: 0,
+        energySpent: 0,
+        newEnergy: calculateValidEnergy(currentUser),
+        newBalance: currentUser.coin_balance,
+        aiLevelUp: false,
+        newAiLevel: currentUser.ai_level,
+        suspicious: true,
+      });
     }
-    
-    // 8. Add XP and check level up
-    const { leveledUp, newLevel } = await addXp(user.id, xpGained);
-    
-    // 9. Re-fetch user for response
-    const updated = await getUserByTelegramId(user.id);
-    if (!updated) {
-      return c.json({ error: 'User disappeared' }, 500);
-    }
-    
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CORE ECONOMIC TRANSACTION
+    // Everything that touches money / energy MUST be inside this block.
+    // The SELECT ... FOR UPDATE prevents parallel requests from reading stale data.
+    // ─────────────────────────────────────────────────────────────────────────
+    const result = await db.transaction(async (trx) => {
+      // 1. Lock the user row — blocks any concurrent tap/buy on this user
+      const user = await trx('users')
+        .where({ telegram_id: telegramUser.id })
+        .forUpdate()
+        .first();
+
+      if (!user) throw new NotFoundError('User not found');
+      if (user.is_banned) throw new AppError('Account banned', 403, 'BANNED');
+
+      // 2. Validate energy (calculated from locked snapshot, not from middleware cache)
+      const currentEnergy = calculateValidEnergy(user);
+      if (currentEnergy < count) {
+        throw new AppError(
+          'Insufficient energy',
+          400,
+          'INSUFFICIENT_ENERGY',
+        );
+      }
+
+      // 3. Multiplier from passive income (Redis-cached, safe to call inside tx)
+      const passiveIncome = await getPassiveIncomePerHour(telegramUser.id);
+      const multiplier = 1 + Math.floor(passiveIncome / 1000) * 0.1;
+
+      // 4. Calculate rewards
+      const coinsEarned = Math.floor(count * multiplier);
+      const xpGained = count;
+
+      // 5. Debit energy atomically
+      await trx('users')
+        .where({ telegram_id: telegramUser.id })
+        .update({
+          energy: currentEnergy - count,
+          last_energy_update: new Date(),
+        });
+
+      // 6. Credit coins (inside transaction — this IS economic data)
+      let newBalance = user.coin_balance;
+      if (coinsEarned > 0) {
+        const [updated] = await trx('users')
+          .where({ telegram_id: telegramUser.id })
+          .increment('coin_balance', coinsEarned)
+          .increment('total_earned_coins', coinsEarned)
+          .returning('coin_balance');
+        newBalance = updated.coin_balance;
+
+        // Transaction log inside the same tx
+        await trx('transactions').insert({
+          user_id: telegramUser.id,
+          type: 'tap_earn',
+          currency: 'coin',
+          amount: coinsEarned,
+          balance_after: newBalance,
+          related_entity_type: null,
+          related_entity_id: null,
+        });
+      }
+
+      // 7. Level up XP (inside tx — level is economic state)
+      const { leveledUp, newLevel } = await addXp(telegramUser.id, xpGained, trx);
+
+      return {
+        coinsEarned,
+        xpGained,
+        energySpent: count,
+        newEnergy: currentEnergy - count,
+        newBalance,
+        aiLevelUp: leveledUp,
+        newAiLevel: newLevel,
+      };
+    });
+
+    // ── Best-effort stat counters (outside tx — acceptable eventual consistency)
+    db('users')
+      .where({ telegram_id: telegramUser.id })
+      .increment('total_taps', count)
+      .catch((err) => logger.error({ err }, 'Failed to increment total_taps'));
+
     return c.json({
-      coinsEarned: finalCoins,
-      xpGained,
-      energySpent: count,
-      newEnergy: updated.energy,
-      newBalance: updated.coin_balance,
-      aiLevelUp: leveledUp,
-      newAiLevel: newLevel,
-      suspicious,
+      ...result,
+      suspicious: false,
     });
   },
 );
