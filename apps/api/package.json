@@ -6,7 +6,7 @@
   "main": "src/index.ts",
   "scripts": {
     "dev": "bun run --watch src/index.ts",
-    "build": "bun build src/index.ts --target=bun --outdir=dist",
+    "build": "bun build src/index.ts --target=bun --outdir=dist --external=oracledb --external=better-sqlite3 --external=sqlite3 --external=mysql --external=mysql2 --external=tedious --external=pg-native",
     "start": "bun run dist/index.js",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
