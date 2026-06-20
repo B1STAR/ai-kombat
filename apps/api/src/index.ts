@@ -2,7 +2,6 @@
  * AI Kombat - Backend entry point
  * Bun + Hono + TypeScript
  */
-import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
@@ -75,18 +74,19 @@ app.onError((err, c) => {
   return c.json({ error: 'Internal server error' }, 500);
 });
 
-// Start server
-const port = env.PORT;
-serve({ fetch: app.fetch, port }, (info) => {
-  pinoLogger.info(`🚀 AI Kombat API running on http://localhost:${info.port}`);
-  pinoLogger.info(`📱 Frontend URL: ${env.FRONTEND_URL}`);
-  pinoLogger.info(`🌍 Environment: ${env.NODE_ENV}`);
+// Start server avec Bun natif
+const port = Number(env.PORT) || 3001;
+Bun.serve({
+  port,
+  fetch: app.fetch,
 });
+
+pinoLogger.info(`🚀 AI Kombat API running on http://localhost:${port}`);
+pinoLogger.info(`📱 Frontend URL: ${env.FRONTEND_URL}`);
+pinoLogger.info(`🌍 Environment: ${env.NODE_ENV}`);
 
 // Start background workers
 if (env.NODE_ENV === 'production') {
   startCrons();
   startBot();
 }
-
-export default app;
