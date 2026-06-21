@@ -17,6 +17,8 @@ export default function RootLayout({
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
         <meta name="theme-color" content="#0a0e15" />
+        {/* Telegram Mini App SDK — must load before React hydration */}
+        <script src="https://telegram.org/js/telegram-web-app.js" />
       </head>
       <body>
         <TelegramProvider>

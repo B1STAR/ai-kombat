@@ -2,10 +2,10 @@
 
 /**
  * Telegram SDK provider.
- * Initializes the Telegram WebApp SDK and provides initData for auth.
+ * The SDK script is loaded synchronously in layout.tsx <head> so
+ * window.Telegram.WebApp is guaranteed to exist before this useEffect runs.
  */
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
-import Script from 'next/script';
 
 interface TelegramContextValue {
   initData: string;
@@ -32,34 +32,44 @@ export function TelegramProvider({ children }: { children: ReactNode }) {
   const [initData, setInitData] = useState('');
   const [user, setUser] = useState<TelegramContextValue['user']>(null);
   const [isTelegram, setIsTelegram] = useState(false);
-  
+
   useEffect(() => {
-    // Check if we're inside Telegram
-    if (typeof window !== 'undefined' && window.Telegram?.WebApp) {
-      const tg = window.Telegram.WebApp;
-      tg.ready();
-      tg.expand();
-      
-      setInitData(tg.initData || '');
-      setIsTelegram(true);
-      
-      if (tg.initDataUnsafe?.user) {
-        setUser({
-          id: tg.initDataUnsafe.user.id,
-          firstName: tg.initDataUnsafe.user.first_name,
-          username: tg.initDataUnsafe.user.username,
-        });
+    const initialize = () => {
+      if (typeof window !== 'undefined' && window.Telegram?.WebApp) {
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand();
+
+        const rawInitData = tg.initData || '';
+        setInitData(rawInitData);
+        setIsTelegram(true);
+
+        if (tg.initDataUnsafe?.user) {
+          setUser({
+            id: tg.initDataUnsafe.user.id,
+            firstName: tg.initDataUnsafe.user.first_name,
+            username: tg.initDataUnsafe.user.username,
+          });
+        }
+
+        setIsReady(true);
+      } else {
+        // Not inside Telegram (browser dev mode)
+        console.warn('⚠️ Not running inside Telegram. Dev mode active.');
+        setIsTelegram(false);
+        setIsReady(true);
       }
-      
-      setIsReady(true);
+    };
+
+    // If SDK already loaded (script is synchronous in <head>), run immediately.
+    // Fallback: wait for DOMContentLoaded in case of async load.
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initialize, { once: true });
     } else {
-      // Dev mode: not inside Telegram
-      console.warn('⚠️ Not running inside Telegram. Using dev mode.');
-      setIsTelegram(false);
-      setIsReady(true);
+      initialize();
     }
   }, []);
-  
+
   return (
     <TelegramContext.Provider value={{ initData, user, isReady, isTelegram }}>
       {children}
@@ -87,11 +97,9 @@ declare global {
           };
           start_param?: string;
         };
-        // Navigation
         openLink: (url: string, options?: { try_instant_view?: boolean }) => void;
         openTelegramLink: (url: string) => void;
         switchInlineQuery: (query: string, choose_chat_types?: string[]) => void;
-        // Main & Back buttons
         MainButton: {
           text: string;
           show: () => void;
@@ -104,21 +112,17 @@ declare global {
           hide: () => void;
           onClick: (cb: () => void) => void;
         };
-        // Haptic
         HapticFeedback: {
           impactOccurred: (style: 'light' | 'medium' | 'heavy' | 'rigid' | 'soft') => void;
           notificationOccurred: (type: 'error' | 'success' | 'warning') => void;
           selectionChanged: () => void;
         };
-        // Clipboard
         readTextFromClipboard: (callback: (text: string) => void) => void;
-        // Theme & display
         colorScheme: 'light' | 'dark';
         themeParams: Record<string, string>;
         isExpanded: boolean;
         viewportHeight: number;
         viewportStableHeight: number;
-        // Popups
         showPopup: (params: {
           title?: string;
           message: string;
@@ -126,12 +130,9 @@ declare global {
         }, callback?: (buttonId: string) => void) => void;
         showAlert: (message: string, callback?: () => void) => void;
         showConfirm: (message: string, callback?: (confirmed: boolean) => void) => void;
-        // Invoice
         openInvoice: (url: string, callback?: (status: string) => void) => void;
-        // QR
         showScanQrPopup: (params: { text?: string }, callback?: (text: string) => boolean) => void;
         closeScanQrPopup: () => void;
-        // Events
         onEvent: (eventType: string, eventHandler: () => void) => void;
         offEvent: (eventType: string, eventHandler: () => void) => void;
         sendData: (data: string) => void;
