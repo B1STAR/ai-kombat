@@ -1,16 +1,22 @@
 /**
  * Rate limiting middleware using Upstash Redis.
  * Falls back to in-memory if Upstash is not configured (development only).
+ * Fail-open: if Redis is unreachable, request is allowed through (no 500).
  */
 import { Ratelimit } from '@upstash/ratelimit';
 import { Redis } from '@upstash/redis';
 import type { Context, Next } from 'hono';
 import { env } from '../lib/env';
 import { RateLimitError } from '../lib/errors';
+import { logger } from '../lib/logger';
 
 let redis: Redis | null = null;
 if (env.UPSTASH_REDIS_REST_URL && env.UPSTASH_REDIS_REST_TOKEN) {
-  redis = Redis.fromEnv();
+  try {
+    redis = Redis.fromEnv();
+  } catch (e) {
+    logger.warn('Upstash Redis init failed, rate limiting disabled');
+  }
 }
 
 const limits = {
@@ -54,21 +60,28 @@ export const rateLimit = (type: keyof typeof limits) => {
     
     const limiter = limits[type];
     if (!limiter) {
-      // No Redis configured (dev), skip
+      // No Redis configured (dev) or init failed, skip
       await next();
       return;
     }
     
-    const { success, remaining, reset } = await limiter.limit(`${type}:${user.id}`);
-    
-    if (!success) {
-      throw new RateLimitError(
-        `Rate limit exceeded. Try again in ${Math.floor((reset - Date.now()) / 1000)}s`
-      );
+    try {
+      const { success, remaining, reset } = await limiter.limit(`${type}:${user.id}`);
+      
+      if (!success) {
+        throw new RateLimitError(
+          `Rate limit exceeded. Try again in ${Math.floor((reset - Date.now()) / 1000)}s`
+        );
+      }
+      
+      c.header('X-RateLimit-Remaining', remaining.toString());
+      c.header('X-RateLimit-Reset', reset.toString());
+    } catch (err) {
+      // If it's a rate limit error, re-throw it
+      if (err instanceof RateLimitError) throw err;
+      // Otherwise: Redis unreachable → fail-open, log warning, allow request
+      logger.warn({ err, type }, 'Rate limiter unavailable, failing open');
     }
-    
-    c.header('X-RateLimit-Remaining', remaining.toString());
-    c.header('X-RateLimit-Reset', reset.toString());
     
     await next();
   };
