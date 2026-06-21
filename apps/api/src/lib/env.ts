@@ -7,6 +7,12 @@ import * as dotenv from 'dotenv';
 
 dotenv.config();
 
+// Upstash requires an HTTPS REST URL, not a redis:// protocol URL.
+// If the configured URL uses redis://, treat it as not set (local Redis is not compatible).
+const upstashUrl = process.env.UPSTASH_REDIS_REST_URL;
+const isUpstashConfigured =
+  upstashUrl && upstashUrl.startsWith('https://');
+
 const envSchema = z.object({
   // Server
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
@@ -24,9 +30,13 @@ const envSchema = z.object({
   SUPABASE_ANON_KEY: z.string().optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
 
-  // Cache (Upstash)
-  UPSTASH_REDIS_REST_URL: z.string().url().optional(),
-  UPSTASH_REDIS_REST_TOKEN: z.string().optional(),
+  // Cache (Upstash) — only valid if HTTPS REST URL, not local redis://
+  UPSTASH_REDIS_REST_URL: isUpstashConfigured
+    ? z.string().url()
+    : z.string().optional().transform(() => undefined),
+  UPSTASH_REDIS_REST_TOKEN: isUpstashConfigured
+    ? z.string().min(1)
+    : z.string().optional().transform(() => undefined),
 
   // Auth
   JWT_SECRET: z.string().min(16).default('change-me-in-production-please-use-a-long-random-string'),

@@ -44,10 +44,12 @@ const passiveIncome = async () => {
       .select('telegram_id');
     
     for (const user of users) {
+      // Use db.raw for the arithmetic expression to avoid Knex misinterpreting
+      // 'ai_modules.coins_per_hour_bonus * user_modules.level' as a table identifier
       const result = await db('user_modules')
-        .where('user_id', user.telegram_id)
+        .where('user_modules.user_id', user.telegram_id)
         .join('ai_modules', 'ai_modules.id', 'user_modules.module_id')
-        .sum('ai_modules.coins_per_hour_bonus * user_modules.level as hourly')
+        .select(db.raw('SUM(ai_modules.coins_per_hour_bonus * user_modules.level) as hourly'))
         .first();
       
       const hourly = Number(result?.hourly || 0);
