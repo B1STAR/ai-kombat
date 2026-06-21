@@ -127,8 +127,9 @@ export const getPassiveIncomePerHour = async (userId: number): Promise<number> =
   const result = await db('user_modules')
     .where({ user_id: userId })
     .join('ai_modules', 'ai_modules.id', 'user_modules.module_id')
-    .sum('ai_modules.coins_per_hour_bonus * user_modules.level as total')
+    // db.raw() required — Knex cannot handle arithmetic expressions in .sum()
+    .sum(db.raw('ai_modules.coins_per_hour_bonus * user_modules.level') as any)
     .first();
   
-  return Number(result?.total || 0);
+  return Number((result as any)?.sum || 0);
 };
