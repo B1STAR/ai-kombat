@@ -28,12 +28,15 @@ export default function GamePage() {
   const [isTapping, setIsTapping] = useState(false);
   const tapTimeoutRef = useRef<NodeJS.Timeout>();
 
+  // FIX: use refs so values persist across re-renders
+  const tapPendingRef = useRef(false);
+  const tapPendingCountRef = useRef(0);
+  const tapBatchTimeoutRef = useRef<NodeJS.Timeout>();
+
   // Init user on mount — only when SDK is ready AND initData is available
   useEffect(() => {
     if (!isReady) return;
 
-    // Guard: if we are inside Telegram but initData is still empty,
-    // the SDK script hasn't delivered initData yet — do not proceed.
     if (isTelegram && !initData) {
       console.warn('Telegram detected but initData is empty — waiting for SDK.');
       return;
@@ -41,7 +44,6 @@ export default function GamePage() {
 
     const init = async () => {
       try {
-        // Parse referral from URL start_param
         const tgStartParam =
           typeof window !== 'undefined'
             ? window.Telegram?.WebApp?.initDataUnsafe?.start_param || ''
@@ -55,7 +57,6 @@ export default function GamePage() {
         setUser(response.user);
       } catch (err: any) {
         console.error('Init failed:', err);
-        // Fallback dev user only when NOT inside Telegram
         if (!isTelegram) {
           setUser({
             id: 1,
@@ -85,7 +86,6 @@ export default function GamePage() {
     };
 
     init();
-    // Re-run if initData arrives after isReady (race condition safety)
   }, [isReady, initData]);
 
   // Energy regen (passive)
@@ -130,38 +130,40 @@ export default function GamePage() {
       setFloatingCoins((prev) => prev.filter((c) => c.id !== id));
     }, 1000);
 
-    // Batch taps every 500ms
-    if (!handleTap.pending) {
-      handleTap.pending = true;
-      handleTap.pendingCount = 1;
-      setTimeout(async () => {
+    // FIX: Batch taps using refs — values survive re-renders
+    tapPendingCountRef.current += 1;
+
+    if (!tapPendingRef.current) {
+      tapPendingRef.current = true;
+
+      clearTimeout(tapBatchTimeoutRef.current);
+      tapBatchTimeoutRef.current = setTimeout(async () => {
+        const batchCount = tapPendingCountRef.current;
+        tapPendingCountRef.current = 0;
+        tapPendingRef.current = false;
+
         try {
           const response = await api.post<any>('/api/tap', {
-            count: handleTap.pendingCount,
+            count: batchCount,
             clientTimestamp: new Date().toISOString(),
           });
 
           if (response.suspicious) {
             hapticNotification('warning');
           } else {
-            const diff = response.coinsEarned - handleTap.pendingCount;
+            // Sync only the DIFF between what backend confirmed vs optimistic
+            const diff = response.coinsEarned - batchCount;
             if (diff !== 0) addCoins(diff);
             if (response.aiLevelUp) hapticNotification('success');
           }
         } catch (err) {
           console.error('Tap failed:', err);
-        } finally {
-          handleTap.pending = false;
-          handleTap.pendingCount = 0;
+          // On error, revert optimistic coins
+          addCoins(-batchCount);
         }
       }, 500);
-    } else {
-      handleTap.pendingCount++;
     }
   };
-
-  handleTap.pending = false;
-  handleTap.pendingCount = 0;
 
   if (!user) {
     return (
