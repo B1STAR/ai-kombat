@@ -22,7 +22,9 @@ const envSchema = z.object({
 
   // Telegram
   TELEGRAM_BOT_TOKEN: z.string().min(1, 'TELEGRAM_BOT_TOKEN is required'),
-  TELEGRAM_BOT_USERNAME: z.string().default('AIKombatBot'),
+  // Must match the exact @username WITHOUT the @ prefix.
+  // The bot username is @ai_kombatbot => value: ai_kombatbot
+  TELEGRAM_BOT_USERNAME: z.string().default('ai_kombatbot'),
 
   // Database
   DATABASE_URL: z.string().url('DATABASE_URL must be a valid PostgreSQL URL'),
