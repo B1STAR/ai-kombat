@@ -24,6 +24,10 @@ export default function GamePage() {
   const { isTelegram, initData, isReady } = useTelegram();
   const { user, setUser, updateEnergy } = useGameStore();
 
+  // Keep a ref to user so the async batch callback always has the latest value
+  const userRef = useRef(user);
+  useEffect(() => { userRef.current = user; }, [user]);
+
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
   const [isTapping, setIsTapping] = useState(false);
   const tapTimeoutRef = useRef<NodeJS.Timeout>();
@@ -123,7 +127,6 @@ export default function GamePage() {
 
     // Optimistic UI: subtract energy, add +1 coin locally
     updateEnergy(-1);
-    // Update coin display immediately via setUser to avoid stale closure bug
     setUser({ ...user, coin_balance: user.coin_balance + 1, energy: user.energy - 1 });
     optimisticAddedRef.current += 1;
 
@@ -150,11 +153,12 @@ export default function GamePage() {
           clientTimestamp: new Date().toISOString(),
         });
 
-        // FIX: Always sync to the authoritative newBalance from the API.
-        // This avoids any drift from optimistic updates.
-        setUser((prev: any) =>
-          prev ? { ...prev, coin_balance: response.newBalance, energy: response.newEnergy } : prev
-        );
+        // Sync to the authoritative newBalance from the API using the ref
+        // to get the latest user without a stale closure.
+        const currentUser = userRef.current;
+        if (currentUser) {
+          setUser({ ...currentUser, coin_balance: response.newBalance, energy: response.newEnergy });
+        }
 
         if (response.suspicious) {
           hapticNotification('warning');
@@ -164,9 +168,10 @@ export default function GamePage() {
       } catch (err) {
         console.error('Tap failed:', err);
         // Revert optimistic coins on network error
-        setUser((prev: any) =>
-          prev ? { ...prev, coin_balance: prev.coin_balance - optimisticCoins } : prev
-        );
+        const currentUser = userRef.current;
+        if (currentUser) {
+          setUser({ ...currentUser, coin_balance: currentUser.coin_balance - optimisticCoins });
+        }
       }
     }, 600);
   };
