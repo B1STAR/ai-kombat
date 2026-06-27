@@ -20,7 +20,7 @@ export default function ShopPage() {
   }, {} as Record<string, number>);
 
   // Build a quick lookup: code → module object (for dependency chain resolution)
-  const moduleByCode = modules.reduce((acc, m) => {
+  const moduleByCode: Record<string, AiModule> = modules.reduce((acc, m) => {
     acc[m.code] = m;
     return acc;
   }, {} as Record<string, AiModule>);
@@ -114,29 +114,12 @@ export default function ShopPage() {
                 const hasRequiredModule = !mod.requiredModuleCode || (moduleLevelByCode[mod.requiredModuleCode] ?? 0) > 0;
                 const canBuy = canAfford && meetsLevel && hasRequiredModule && !mod.isMaxLevel;
 
-                // Résoudre la chaîne complète des prérequis pour affichage
-                // Ex: si A requires B requires C, on affiche la chaîne
-                const getFullRequirementChain = (code: string | null): string[] => {
-                  if (!code) return [];
-                  const chain: string[] = [];
-                  let current: string | null = code;
-                  const visited = new Set<string>();
-                  while (current && !visited.has(current)) {
-                    visited.add(current);
-                    const m = moduleByCode[current];
-                    if (m) chain.push(m.name);
-                    else chain.push(current); // fallback si inconnu
-                    current = m?.requiredModuleCode ?? null;
-                  }
-                  return chain;
-                };
-
                 // Prérequis direct non satisfait
-                const missingRequiredModule = mod.requiredModuleCode && !hasRequiredModule
-                  ? moduleByCode[mod.requiredModuleCode]
+                const missingRequiredModule: AiModule | null = (mod.requiredModuleCode && !hasRequiredModule)
+                  ? (moduleByCode[mod.requiredModuleCode] ?? null)
                   : null;
 
-                // Build progress label: Lvl 3 / 20
+                // Build progress label: Niv. 3 / 20
                 const progressLabel = mod.isMaxLevel
                   ? `Max (${mod.maxLevel})`
                   : mod.currentLevel > 0
@@ -177,13 +160,13 @@ export default function ShopPage() {
                           {missingRequiredModule && (
                             <span className="text-purple-400 flex items-center gap-1">
                               <Lock className="w-3 h-3" />
-                              Prérequis : {missingRequiredModule.name}
+                              Prérequis : {missingRequiredModule.name}
                               {missingRequiredModule.requiredModuleCode &&
                                 !((moduleLevelByCode[missingRequiredModule.requiredModuleCode] ?? 0) > 0) && (
-                                <span className="text-dark-400 ml-1">
-                                  (lui-même bloqué par {moduleByCode[missingRequiredModule.requiredModuleCode]?.name ?? missingRequiredModule.requiredModuleCode})
-                                </span>
-                              )}
+                                  <span className="text-dark-400 ml-1">
+                                    (bloqué par {moduleByCode[missingRequiredModule.requiredModuleCode]?.name ?? missingRequiredModule.requiredModuleCode})
+                                  </span>
+                                )}
                             </span>
                           )}
                         </div>
