@@ -13,11 +13,17 @@ export default function ShopPage() {
   const [loading, setLoading] = useState(true);
   const [buying, setBuying] = useState<number | null>(null);
 
-  // Build a quick lookup: code → currentLevel
+  // Build a quick lookup: code → currentLevel (0 if not owned)
   const moduleLevelByCode = modules.reduce((acc, m) => {
     acc[m.code] = m.currentLevel;
     return acc;
   }, {} as Record<string, number>);
+
+  // Build a quick lookup: code → module object (for dependency chain resolution)
+  const moduleByCode = modules.reduce((acc, m) => {
+    acc[m.code] = m;
+    return acc;
+  }, {} as Record<string, AiModule>);
 
   useEffect(() => {
     api.get<{ modules: AiModule[] }>('/api/modules')
@@ -38,7 +44,7 @@ export default function ShopPage() {
     // Check required module
     if (module.requiredModuleCode && !moduleLevelByCode[module.requiredModuleCode]) {
       hapticNotification('error');
-      const req = modules.find((m) => m.code === module.requiredModuleCode);
+      const req = moduleByCode[module.requiredModuleCode];
       alert(`Prérequis : achète d'abord « ${req?.name ?? module.requiredModuleCode} »`);
       return;
     }
@@ -53,7 +59,7 @@ export default function ShopPage() {
       setBuying(module.id);
       const response = await api.post<{ newBalance: number }>('/api/modules/buy', { moduleId: module.id });
       spendCoins(module.nextLevelCost || module.baseCost);
-      setUser({ ...user, coin_balance: response.newBalance });
+      setUser({ ...user, coin_balance: Number(response.newBalance) });
       hapticNotification('success');
 
       const refreshed = await api.get<{ modules: AiModule[] }>('/api/modules');
@@ -108,9 +114,26 @@ export default function ShopPage() {
                 const hasRequiredModule = !mod.requiredModuleCode || (moduleLevelByCode[mod.requiredModuleCode] ?? 0) > 0;
                 const canBuy = canAfford && meetsLevel && hasRequiredModule && !mod.isMaxLevel;
 
-                // Find the required module's display name
-                const requiredModuleName = mod.requiredModuleCode
-                  ? (modules.find((m) => m.code === mod.requiredModuleCode)?.name ?? mod.requiredModuleCode)
+                // Résoudre la chaîne complète des prérequis pour affichage
+                // Ex: si A requires B requires C, on affiche la chaîne
+                const getFullRequirementChain = (code: string | null): string[] => {
+                  if (!code) return [];
+                  const chain: string[] = [];
+                  let current: string | null = code;
+                  const visited = new Set<string>();
+                  while (current && !visited.has(current)) {
+                    visited.add(current);
+                    const m = moduleByCode[current];
+                    if (m) chain.push(m.name);
+                    else chain.push(current); // fallback si inconnu
+                    current = m?.requiredModuleCode ?? null;
+                  }
+                  return chain;
+                };
+
+                // Prérequis direct non satisfait
+                const missingRequiredModule = mod.requiredModuleCode && !hasRequiredModule
+                  ? moduleByCode[mod.requiredModuleCode]
                   : null;
 
                 // Build progress label: Lvl 3 / 20
@@ -151,10 +174,16 @@ export default function ShopPage() {
                               AI Niv. {mod.minAiLevel} requis
                             </span>
                           )}
-                          {!hasRequiredModule && requiredModuleName && (
+                          {missingRequiredModule && (
                             <span className="text-purple-400 flex items-center gap-1">
                               <Lock className="w-3 h-3" />
-                              Prérequis : {requiredModuleName}
+                              Prérequis : {missingRequiredModule.name}
+                              {missingRequiredModule.requiredModuleCode &&
+                                !((moduleLevelByCode[missingRequiredModule.requiredModuleCode] ?? 0) > 0) && (
+                                <span className="text-dark-400 ml-1">
+                                  (lui-même bloqué par {moduleByCode[missingRequiredModule.requiredModuleCode]?.name ?? missingRequiredModule.requiredModuleCode})
+                                </span>
+                              )}
                             </span>
                           )}
                         </div>
