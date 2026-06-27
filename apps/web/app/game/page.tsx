@@ -22,18 +22,19 @@ interface FloatingCoin {
 export default function GamePage() {
   const api = useApi();
   const { isTelegram, initData, isReady } = useTelegram();
-  const { user, setUser, addCoins, updateEnergy } = useGameStore();
+  const { user, setUser, updateEnergy } = useGameStore();
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
   const [isTapping, setIsTapping] = useState(false);
   const tapTimeoutRef = useRef<NodeJS.Timeout>();
 
-  // FIX: use refs so values persist across re-renders
-  const tapPendingRef = useRef(false);
+  // Batch tap refs — values survive re-renders and closures
   const tapPendingCountRef = useRef(0);
   const tapBatchTimeoutRef = useRef<NodeJS.Timeout>();
+  // Track optimistic coins added so we can revert on error
+  const optimisticAddedRef = useRef(0);
 
-  // Init user on mount — only when SDK is ready AND initData is available
+  // Init user on mount
   useEffect(() => {
     if (!isReady) return;
 
@@ -98,7 +99,7 @@ export default function GamePage() {
   }, [user?.max_energy]);
 
   // Handle tap
-  const handleTap = async (e: React.MouseEvent | React.TouchEvent) => {
+  const handleTap = (e: React.MouseEvent | React.TouchEvent) => {
     if (!user || user.energy < 1) {
       hapticNotification('error');
       return;
@@ -120,9 +121,11 @@ export default function GamePage() {
 
     hapticImpact('light');
 
-    // Optimistic UI update
+    // Optimistic UI: subtract energy, add +1 coin locally
     updateEnergy(-1);
-    addCoins(1);
+    // Update coin display immediately via setUser to avoid stale closure bug
+    setUser({ ...user, coin_balance: user.coin_balance + 1, energy: user.energy - 1 });
+    optimisticAddedRef.current += 1;
 
     const id = Date.now() + Math.random();
     setFloatingCoins((prev) => [...prev, { id, x: clientX, y: clientY, amount: 1 }]);
@@ -130,39 +133,42 @@ export default function GamePage() {
       setFloatingCoins((prev) => prev.filter((c) => c.id !== id));
     }, 1000);
 
-    // FIX: Batch taps using refs — values survive re-renders
+    // Accumulate taps for the current batch
     tapPendingCountRef.current += 1;
 
-    if (!tapPendingRef.current) {
-      tapPendingRef.current = true;
+    // Reset/extend the debounce timer on every tap
+    clearTimeout(tapBatchTimeoutRef.current);
+    tapBatchTimeoutRef.current = setTimeout(async () => {
+      const batchCount = tapPendingCountRef.current;
+      const optimisticCoins = optimisticAddedRef.current;
+      tapPendingCountRef.current = 0;
+      optimisticAddedRef.current = 0;
 
-      clearTimeout(tapBatchTimeoutRef.current);
-      tapBatchTimeoutRef.current = setTimeout(async () => {
-        const batchCount = tapPendingCountRef.current;
-        tapPendingCountRef.current = 0;
-        tapPendingRef.current = false;
+      try {
+        const response = await api.post<any>('/api/tap', {
+          count: batchCount,
+          clientTimestamp: new Date().toISOString(),
+        });
 
-        try {
-          const response = await api.post<any>('/api/tap', {
-            count: batchCount,
-            clientTimestamp: new Date().toISOString(),
-          });
+        // FIX: Always sync to the authoritative newBalance from the API.
+        // This avoids any drift from optimistic updates.
+        setUser((prev: any) =>
+          prev ? { ...prev, coin_balance: response.newBalance, energy: response.newEnergy } : prev
+        );
 
-          if (response.suspicious) {
-            hapticNotification('warning');
-          } else {
-            // Sync only the DIFF between what backend confirmed vs optimistic
-            const diff = response.coinsEarned - batchCount;
-            if (diff !== 0) addCoins(diff);
-            if (response.aiLevelUp) hapticNotification('success');
-          }
-        } catch (err) {
-          console.error('Tap failed:', err);
-          // On error, revert optimistic coins
-          addCoins(-batchCount);
+        if (response.suspicious) {
+          hapticNotification('warning');
+        } else if (response.aiLevelUp) {
+          hapticNotification('success');
         }
-      }, 500);
-    }
+      } catch (err) {
+        console.error('Tap failed:', err);
+        // Revert optimistic coins on network error
+        setUser((prev: any) =>
+          prev ? { ...prev, coin_balance: prev.coin_balance - optimisticCoins } : prev
+        );
+      }
+    }, 600);
   };
 
   if (!user) {

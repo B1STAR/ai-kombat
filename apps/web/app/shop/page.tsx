@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { ShoppingBag, Lock, Check, Coins } from 'lucide-react';
+import { ShoppingBag, Lock, Check, Coins, AlertCircle } from 'lucide-react';
 import { useApi, type AiModule } from '@/lib/api';
 import { useGameStore } from '@/lib/store';
 import { BottomNav } from '@/components/BottomNav';
@@ -12,35 +12,50 @@ export default function ShopPage() {
   const { user, spendCoins, setUser, modules, setModules } = useGameStore();
   const [loading, setLoading] = useState(true);
   const [buying, setBuying] = useState<number | null>(null);
-  
+
+  // Build a quick lookup: code → currentLevel
+  const moduleLevelByCode = modules.reduce((acc, m) => {
+    acc[m.code] = m.currentLevel;
+    return acc;
+  }, {} as Record<string, number>);
+
   useEffect(() => {
     api.get<{ modules: AiModule[] }>('/api/modules')
       .then((res) => setModules(res.modules))
       .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
-  
+
   const handleBuy = async (module: AiModule) => {
     if (!user) return;
+
     if (user.ai_level < module.minAiLevel) {
       hapticNotification('error');
-      alert(`Your AI must be level ${module.minAiLevel}`);
+      alert(`Ton AI doit être niveau ${module.minAiLevel}`);
       return;
     }
+
+    // Check required module
+    if (module.requiredModuleCode && !moduleLevelByCode[module.requiredModuleCode]) {
+      hapticNotification('error');
+      const req = modules.find((m) => m.code === module.requiredModuleCode);
+      alert(`Prérequis : achète d'abord « ${req?.name ?? module.requiredModuleCode} »`);
+      return;
+    }
+
     if (module.nextLevelCost && user.coin_balance < module.nextLevelCost) {
       hapticNotification('error');
-      alert('Not enough coins');
+      alert('Pas assez de coins');
       return;
     }
-    
+
     try {
       setBuying(module.id);
       const response = await api.post<{ newBalance: number }>('/api/modules/buy', { moduleId: module.id });
       spendCoins(module.nextLevelCost || module.baseCost);
       setUser({ ...user, coin_balance: response.newBalance });
       hapticNotification('success');
-      
-      // Refresh modules
+
       const refreshed = await api.get<{ modules: AiModule[] }>('/api/modules');
       setModules(refreshed.modules);
     } catch (err: any) {
@@ -50,20 +65,20 @@ export default function ShopPage() {
       setBuying(null);
     }
   };
-  
+
   const groupedModules = modules.reduce((acc, m) => {
     if (!acc[m.category]) acc[m.category] = [];
     acc[m.category].push(m);
     return acc;
   }, {} as Record<string, AiModule[]>);
-  
+
   const categoryNames: Record<string, { name: string; icon: string; color: string }> = {
-    compute: { name: 'Compute', icon: '⚡', color: 'text-yellow-400' },
-    specialty: { name: 'Specialties', icon: '🧠', color: 'text-accent-400' },
-    dataset: { name: 'Datasets', icon: '📚', color: 'text-blue-400' },
-    algorithm: { name: 'Algorithms', icon: '⚙️', color: 'text-green-400' },
+    compute:   { name: 'Compute',      icon: '⚡', color: 'text-yellow-400' },
+    specialty: { name: 'Spécialités',  icon: '🧠', color: 'text-accent-400' },
+    dataset:   { name: 'Datasets',     icon: '📚', color: 'text-blue-400' },
+    algorithm: { name: 'Algorithmes',  icon: '⚙️', color: 'text-green-400' },
   };
-  
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center pb-20">
@@ -71,12 +86,12 @@ export default function ShopPage() {
       </div>
     );
   }
-  
+
   return (
     <div className="min-h-screen pb-20 px-4 pt-6">
       <h1 className="text-2xl font-bold mb-1">AI Shop</h1>
-      <p className="text-dark-300 text-sm mb-6">Upgrade your AI to earn more</p>
-      
+      <p className="text-dark-300 text-sm mb-6">Améliore ton AI pour gagner plus</p>
+
       {Object.entries(groupedModules).map(([category, mods]) => {
         const cat = categoryNames[category] || { name: category, icon: '📦', color: 'text-white' };
         return (
@@ -85,56 +100,79 @@ export default function ShopPage() {
               <span className="text-2xl">{cat.icon}</span>
               <span className={cat.color}>{cat.name}</span>
             </h2>
-            
+
             <div className="space-y-3">
               {mods.map((mod) => {
                 const canAfford = user && mod.nextLevelCost !== null && user.coin_balance >= mod.nextLevelCost;
                 const meetsLevel = user && user.ai_level >= mod.minAiLevel;
-                const canBuy = canAfford && meetsLevel && !mod.isMaxLevel;
-                
+                const hasRequiredModule = !mod.requiredModuleCode || (moduleLevelByCode[mod.requiredModuleCode] ?? 0) > 0;
+                const canBuy = canAfford && meetsLevel && hasRequiredModule && !mod.isMaxLevel;
+
+                // Find the required module's display name
+                const requiredModuleName = mod.requiredModuleCode
+                  ? (modules.find((m) => m.code === mod.requiredModuleCode)?.name ?? mod.requiredModuleCode)
+                  : null;
+
+                // Build progress label: Lvl 3 / 20
+                const progressLabel = mod.isMaxLevel
+                  ? `Max (${mod.maxLevel})`
+                  : mod.currentLevel > 0
+                  ? `Niv. ${mod.currentLevel} / ${mod.maxLevel}`
+                  : `0 / ${mod.maxLevel}`;
+
                 return (
                   <div
                     key={mod.id}
                     className={cn(
-                      "card transition-all",
-                      mod.isMaxLevel ? "opacity-60" : "",
-                      !meetsLevel ? "opacity-50" : ""
+                      'card transition-all',
+                      mod.isMaxLevel ? 'opacity-60' : '',
+                      (!meetsLevel || !hasRequiredModule) ? 'opacity-50' : ''
                     )}
                   >
                     <div className="flex items-start justify-between">
                       <div className="flex-1">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <h3 className="font-semibold">{mod.name}</h3>
-                          {mod.currentLevel > 0 && (
-                            <span className="text-xs px-2 py-0.5 rounded-full bg-accent-500/20 text-accent-400">
-                              Lvl {mod.currentLevel}
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-dark-700 text-dark-300">
+                            {progressLabel}
+                          </span>
+                        </div>
+                        <p className="text-sm text-dark-300 mt-1">{mod.description}</p>
+
+                        <div className="flex flex-wrap items-center gap-3 mt-2 text-xs">
+                          {mod.coinsPerHourBonus > 0 && (
+                            <span className="text-green-400">
+                              +{formatNumber(mod.coinsPerHourBonus)}/h par niveau
+                            </span>
+                          )}
+                          {!meetsLevel && (
+                            <span className="text-orange-400 flex items-center gap-1">
+                              <AlertCircle className="w-3 h-3" />
+                              AI Niv. {mod.minAiLevel} requis
+                            </span>
+                          )}
+                          {!hasRequiredModule && requiredModuleName && (
+                            <span className="text-purple-400 flex items-center gap-1">
+                              <Lock className="w-3 h-3" />
+                              Prérequis : {requiredModuleName}
                             </span>
                           )}
                         </div>
-                        <p className="text-sm text-dark-300 mt-1">{mod.description}</p>
-                        <div className="flex items-center gap-3 mt-2 text-xs">
-                          {mod.coinsPerHourBonus > 0 && (
-                            <span className="text-green-400">+{formatNumber(mod.coinsPerHourBonus * mod.currentLevel)}/h</span>
-                          )}
-                          {!meetsLevel && (
-                            <span className="text-orange-400">⚠️ Requires AI Lvl {mod.minAiLevel}</span>
-                          )}
-                        </div>
                       </div>
-                      
+
                       {mod.isMaxLevel ? (
-                        <Check className="w-6 h-6 text-green-400" />
-                      ) : !meetsLevel ? (
-                        <Lock className="w-5 h-5 text-dark-300" />
+                        <Check className="w-6 h-6 text-green-400 shrink-0" />
+                      ) : (!meetsLevel || !hasRequiredModule) ? (
+                        <Lock className="w-5 h-5 text-dark-300 shrink-0" />
                       ) : (
                         <button
                           onClick={() => handleBuy(mod)}
                           disabled={!canBuy || buying === mod.id}
                           className={cn(
-                            "px-4 py-2 rounded-xl font-semibold transition-all",
+                            'px-4 py-2 rounded-xl font-semibold transition-all shrink-0',
                             canBuy
-                              ? "bg-accent-500 hover:bg-accent-600 text-white active:scale-95"
-                              : "bg-dark-700 text-dark-300"
+                              ? 'bg-accent-500 hover:bg-accent-600 text-white active:scale-95'
+                              : 'bg-dark-700 text-dark-300'
                           )}
                         >
                           {buying === mod.id ? '...' : (
@@ -153,7 +191,7 @@ export default function ShopPage() {
           </div>
         );
       })}
-      
+
       <BottomNav />
     </div>
   );
