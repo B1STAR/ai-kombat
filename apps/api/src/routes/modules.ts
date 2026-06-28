@@ -35,6 +35,11 @@ modules.get('/', authMiddleware, async (c) => {
       ? Math.floor(m.base_cost * Math.pow(m.cost_multiplier, userLevel))
       : m.base_cost;
     
+    // Gains réels actuels = bonus_par_niveau × niveau_actuel_du_user
+    const currentCoinsPerHour = m.coins_per_hour_bonus * userLevel;
+    // Gain que le prochain achat va ajouter
+    const nextLevelCoinsPerHour = m.coins_per_hour_bonus;
+    
     return {
       id: m.id,
       code: m.code,
@@ -46,6 +51,8 @@ modules.get('/', authMiddleware, async (c) => {
       costMultiplier: m.cost_multiplier,
       maxLevel: m.max_level,
       coinsPerHourBonus: m.coins_per_hour_bonus,
+      currentCoinsPerHour,
+      nextLevelCoinsPerHour,
       minAiLevel: m.min_ai_level,
       requiredModuleCode: m.required_module_code,
       rarity: m.rarity,
@@ -72,6 +79,8 @@ modules.post(
       return c.json({
         success: true,
         newBalance: updated.coin_balance,
+        aiLevelUp: updated.aiLevelUp ?? false,
+        newAiLevel: updated.newAiLevel ?? null,
       });
     } catch (err: any) {
       return c.json({ error: err.message }, 400);

@@ -50,7 +50,11 @@ export const addXp = async (userId: number, xpGained: number): Promise<{ leveled
 // ============================================
 // MODULES
 // ============================================
-export const buyModule = async (userId: number, moduleId: number): Promise<User> => {
+
+// Code du module spécial qui monte directement l'AI level
+const AI_TRAINING_MODULE_CODE = 'ai_training';
+
+export const buyModule = async (userId: number, moduleId: number): Promise<User & { aiLevelUp?: boolean; newAiLevel?: number }> => {
   return await db.transaction(async (trx) => {
     const moduleData = await trx('ai_modules').where({ id: moduleId }).first();
     if (!moduleData) throw new Error('Module not found');
@@ -118,8 +122,25 @@ export const buyModule = async (userId: number, moduleId: number): Promise<User>
       related_entity_id: moduleId,
     });
     
+    // ── MODULE SPÉCIAL : Entraînement IA ──
+    // Si c'est le module ai_training, chaque niveau acheté = +1 AI level
+    let aiLevelUp = false;
+    let newAiLevel = user.ai_level;
+    
+    if (moduleData.code === AI_TRAINING_MODULE_CODE) {
+      newAiLevel = user.ai_level + 1;
+      if (newAiLevel > 100) newAiLevel = 100; // cap à 100
+      await trx('users')
+        .where({ telegram_id: userId })
+        .update({
+          ai_level: newAiLevel,
+          ai_type: aiTypeForLevel(newAiLevel),
+        });
+      aiLevelUp = true;
+    }
+    
     const updated = await trx('users').where({ telegram_id: userId }).first();
-    return updated;
+    return { ...updated, aiLevelUp, newAiLevel };
   });
 };
 

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { ShoppingBag, Lock, Check, Coins, AlertCircle } from 'lucide-react';
+import { ShoppingBag, Lock, Check, Coins, AlertCircle, TrendingUp } from 'lucide-react';
 import { useApi, type AiModule } from '@/lib/api';
 import { useGameStore } from '@/lib/store';
 import { BottomNav } from '@/components/BottomNav';
@@ -57,10 +57,19 @@ export default function ShopPage() {
 
     try {
       setBuying(module.id);
-      const response = await api.post<{ newBalance: number }>('/api/modules/buy', { moduleId: module.id });
+      const response = await api.post<{ newBalance: number; aiLevelUp?: boolean; newAiLevel?: number }>(
+        '/api/modules/buy',
+        { moduleId: module.id }
+      );
       spendCoins(module.nextLevelCost || module.baseCost);
       setUser({ ...user, coin_balance: Number(response.newBalance) });
       hapticNotification('success');
+
+      // Si c'est un module Entraînement IA → mise à jour du niveau AI en local
+      if (response.aiLevelUp && response.newAiLevel != null) {
+        setUser({ ...user, coin_balance: Number(response.newBalance), ai_level: response.newAiLevel });
+        alert(`🎉 AI Level Up ! Ton IA est maintenant niveau ${response.newAiLevel}`);
+      }
 
       const refreshed = await api.get<{ modules: AiModule[] }>('/api/modules');
       setModules(refreshed.modules);
@@ -79,10 +88,11 @@ export default function ShopPage() {
   }, {} as Record<string, AiModule[]>);
 
   const categoryNames: Record<string, { name: string; icon: string; color: string }> = {
-    compute:   { name: 'Compute',      icon: '⚡', color: 'text-yellow-400' },
-    specialty: { name: 'Spécialités',  icon: '🧠', color: 'text-accent-400' },
-    dataset:   { name: 'Datasets',     icon: '📚', color: 'text-blue-400' },
-    algorithm: { name: 'Algorithmes',  icon: '⚙️', color: 'text-green-400' },
+    training:  { name: 'Entraînement IA', icon: '🧬', color: 'text-pink-400' },
+    compute:   { name: 'Compute',         icon: '⚡', color: 'text-yellow-400' },
+    specialty: { name: 'Spécialités',     icon: '🧠', color: 'text-accent-400' },
+    dataset:   { name: 'Datasets',        icon: '📚', color: 'text-blue-400' },
+    algorithm: { name: 'Algorithmes',     icon: '⚙️', color: 'text-green-400' },
   };
 
   if (loading) {
@@ -119,12 +129,18 @@ export default function ShopPage() {
                   ? (moduleByCode[mod.requiredModuleCode] ?? null)
                   : null;
 
-                // Build progress label: Niv. 3 / 20
+                // Build progress label
                 const progressLabel = mod.isMaxLevel
                   ? `Max (${mod.maxLevel})`
                   : mod.currentLevel > 0
                   ? `Niv. ${mod.currentLevel} / ${mod.maxLevel}`
                   : `0 / ${mod.maxLevel}`;
+
+                // Gains affichés :
+                // - Si le user possède déjà ce module → montrer le total actuel + le prochain gain
+                // - Sinon → montrer le gain du 1er niveau
+                const currentHourly = (mod as any).currentCoinsPerHour ?? 0;
+                const nextHourly = (mod as any).nextLevelCoinsPerHour ?? mod.coinsPerHourBonus;
 
                 return (
                   <div
@@ -146,9 +162,23 @@ export default function ShopPage() {
                         <p className="text-sm text-dark-300 mt-1">{mod.description}</p>
 
                         <div className="flex flex-wrap items-center gap-3 mt-2 text-xs">
-                          {mod.coinsPerHourBonus > 0 && (
-                            <span className="text-green-400">
-                              +{formatNumber(mod.coinsPerHourBonus)}/h par niveau
+                          {/* Gains actuels si module déjà possédé */}
+                          {currentHourly > 0 && (
+                            <span className="text-green-400 flex items-center gap-1">
+                              <TrendingUp className="w-3 h-3" />
+                              {formatNumber(currentHourly)}/h actuel
+                            </span>
+                          )}
+                          {/* Gain du prochain niveau */}
+                          {nextHourly > 0 && !mod.isMaxLevel && (
+                            <span className="text-yellow-400">
+                              +{formatNumber(nextHourly)}/h prochain niv.
+                            </span>
+                          )}
+                          {/* Module entraînement IA : afficher le niveau AI actuel */}
+                          {mod.code === 'ai_training' && user && (
+                            <span className="text-pink-400 flex items-center gap-1">
+                              🧬 AI Niv. actuel : {user.ai_level}
                             </span>
                           )}
                           {!meetsLevel && (
@@ -160,11 +190,11 @@ export default function ShopPage() {
                           {missingRequiredModule && (
                             <span className="text-purple-400 flex items-center gap-1">
                               <Lock className="w-3 h-3" />
-                              Prérequis : {missingRequiredModule.name}
+                              Prérequis : {missingRequiredModule.name}
                               {missingRequiredModule.requiredModuleCode &&
                                 !((moduleLevelByCode[missingRequiredModule.requiredModuleCode] ?? 0) > 0) && (
                                   <span className="text-dark-400 ml-1">
-                                    (bloqué par {moduleByCode[missingRequiredModule.requiredModuleCode]?.name ?? missingRequiredModule.requiredModuleCode})
+                                    (bloqué par {moduleByCode[missingRequiredModule.requiredModuleCode]?.name ?? missingRequiredModule.requiredModuleCode})
                                   </span>
                                 )}
                             </span>
