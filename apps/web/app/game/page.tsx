@@ -21,7 +21,6 @@ interface FloatingCoin {
 const formatRaw = (n: number): string =>
   Math.floor(n).toLocaleString('fr-FR').replace(/\u202f/g, '\u00a0');
 
-// URL du proxy avatar - evite le CORS de t.me
 const avatarProxyUrl = (telegramId: number) =>
   `${process.env.NEXT_PUBLIC_API_URL || ''}/api/avatar/${telegramId}`;
 
@@ -33,7 +32,6 @@ export default function GamePage() {
 
   const userRef = useRef(user);
   useEffect(() => { userRef.current = user; }, [user]);
-  // Reset erreur avatar si le user change
   useEffect(() => { setAvatarError(false); }, [user?.telegram_id]);
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
@@ -79,10 +77,7 @@ export default function GamePage() {
   }, [user?.max_energy]);
 
   const handleTap = (e: React.MouseEvent | React.TouchEvent) => {
-    if (!user || user.energy < 1) {
-      hapticNotification('error');
-      return;
-    }
+    if (!user || user.energy < 1) { hapticNotification('error'); return; }
     if (isTapping) return;
     setIsTapping(true);
     clearTimeout(tapTimeoutRef.current);
@@ -90,17 +85,14 @@ export default function GamePage() {
 
     let clientX = 0, clientY = 0;
     if ('touches' in e && e.touches[0]) {
-      clientX = e.touches[0].clientX;
-      clientY = e.touches[0].clientY;
+      clientX = e.touches[0].clientX; clientY = e.touches[0].clientY;
     } else if ('clientX' in e) {
-      clientX = e.clientX;
-      clientY = e.clientY;
+      clientX = e.clientX; clientY = e.clientY;
     }
 
     hapticImpact('light');
-    const energyDrain = 2.5;
-    const newEnergy = Math.max(0, user.energy - energyDrain);
-    updateEnergy(-energyDrain);
+    const newEnergy = Math.max(0, user.energy - 2.5);
+    updateEnergy(-2.5);
     setUser({ ...user, coin_balance: user.coin_balance + 1, energy: newEnergy });
     optimisticAddedRef.current += 1;
 
@@ -116,16 +108,13 @@ export default function GamePage() {
       tapPendingCountRef.current = 0;
       optimisticAddedRef.current = 0;
       try {
-        const response = await api.post<any>('/api/tap', {
-          count: batchCount,
-          clientTimestamp: new Date().toISOString(),
-        });
-        const currentUser = userRef.current;
-        if (currentUser) setUser({ ...currentUser, coin_balance: response.newBalance, energy: response.newEnergy });
+        const response = await api.post<any>('/api/tap', { count: batchCount, clientTimestamp: new Date().toISOString() });
+        const cu = userRef.current;
+        if (cu) setUser({ ...cu, coin_balance: response.newBalance, energy: response.newEnergy });
         if (response.aiLevelUp) hapticNotification('success');
-      } catch (err) {
-        const currentUser = userRef.current;
-        if (currentUser) setUser({ ...currentUser, coin_balance: currentUser.coin_balance - optimisticCoins });
+      } catch {
+        const cu = userRef.current;
+        if (cu) setUser({ ...cu, coin_balance: cu.coin_balance - optimisticCoins });
       }
     }, 600);
   };
@@ -147,49 +136,35 @@ export default function GamePage() {
     energyPercent > 50 ? 'from-blue-600 to-violet-500'
     : energyPercent > 20 ? 'from-yellow-500 to-orange-500'
     : 'from-red-700 to-red-500';
-
-  // Avatar : on tente le proxy, fallback sur l'initiale
   const hasAvatar = !!user.photo_url && !avatarError;
 
   return (
     <div className="min-h-screen pb-20 flex flex-col" style={{ background: '#08090f' }}>
 
-      {/* TOP BAR */}
+      {/* ── TOP BAR ── */}
       <div className="flex items-center justify-between px-4 pt-4 pb-3">
         <div className="flex items-center gap-3">
           {hasAvatar ? (
-            <img
-              src={avatarProxyUrl(user.telegram_id)}
-              alt={user.first_name}
+            <img src={avatarProxyUrl(user.telegram_id)} alt={user.first_name}
               className="w-11 h-11 rounded-full border-2 object-cover"
               style={{ borderColor: 'rgba(124,58,237,0.6)' }}
-              onError={() => setAvatarError(true)}
-            />
+              onError={() => setAvatarError(true)} />
           ) : (
-            <div
-              className="w-11 h-11 rounded-full flex items-center justify-center border-2"
-              style={{ background: 'rgba(109,40,217,0.25)', borderColor: 'rgba(124,58,237,0.5)' }}
-            >
+            <div className="w-11 h-11 rounded-full flex items-center justify-center border-2"
+              style={{ background: 'rgba(109,40,217,0.25)', borderColor: 'rgba(124,58,237,0.5)' }}>
               <span className="text-lg font-bold text-violet-300">
                 {user.first_name?.[0]?.toUpperCase() || 'A'}
               </span>
             </div>
           )}
           <div>
-            <p className="text-sm font-bold text-white leading-tight">
-              {user.first_name} {user.last_name || ''}
-            </p>
-            <p className="text-xs text-slate-400 leading-tight capitalize">
-              {user.ai_type} &bull; Level {user.ai_level}
-            </p>
+            <p className="text-sm font-bold text-white leading-tight">{user.first_name} {user.last_name || ''}</p>
+            <p className="text-xs text-slate-400 leading-tight capitalize">{user.ai_type} &bull; Level {user.ai_level}</p>
           </div>
         </div>
 
-        {/* Profit / heure */}
-        <div
-          className="flex items-center gap-2 rounded-2xl px-3 py-2"
-          style={{ background: '#12141f', border: '1px solid #2a2d40' }}
-        >
+        <div className="flex items-center gap-2 rounded-2xl px-3 py-2"
+          style={{ background: '#12141f', border: '1px solid #2a2d40' }}>
           <div className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: 'rgba(234,179,8,0.12)' }}>
             <TrendingUp className="w-4 h-4 text-yellow-400" />
           </div>
@@ -199,29 +174,23 @@ export default function GamePage() {
           </div>
         </div>
 
-        <button
-          className="w-10 h-10 rounded-full flex items-center justify-center"
-          style={{ background: '#12141f', border: '1px solid #2a2d40' }}
-        >
+        <button className="w-10 h-10 rounded-full flex items-center justify-center"
+          style={{ background: '#12141f', border: '1px solid #2a2d40' }}>
           <Settings className="w-5 h-5 text-slate-400" />
         </button>
       </div>
 
-      {/* COINS */}
+      {/* ── COINS ── */}
       <div className="flex justify-center items-center gap-3 pt-1 pb-3">
-        <div
-          className="w-10 h-10 rounded-full flex items-center justify-center"
-          style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}
-        >
+        <div className="w-10 h-10 rounded-full flex items-center justify-center"
+          style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}>
           <span className="text-lg">🪙</span>
         </div>
-        <span className="text-4xl font-extrabold text-white tracking-tight">
-          {formatRaw(user.coin_balance)}
-        </span>
+        <span className="text-4xl font-extrabold text-white tracking-tight">{formatRaw(user.coin_balance)}</span>
       </div>
 
-      {/* SEPARATEUR ARC DORE */}
-      <div className="relative w-full h-6 mb-1" aria-hidden>
+      {/* ── ARC DORÉ ── */}
+      <div className="relative w-full h-6 mb-3" aria-hidden>
         <svg viewBox="0 0 390 24" preserveAspectRatio="none" className="w-full h-full">
           <path d="M0,24 Q195,0 390,24" fill="none" stroke="rgba(180,130,40,0.18)" strokeWidth="8" />
           <path d="M0,24 Q195,0 390,24" fill="none" stroke="url(#goldArc)" strokeWidth="2" strokeLinecap="round" />
@@ -237,13 +206,49 @@ export default function GamePage() {
         </svg>
       </div>
 
-      {/* BOUTON TAP */}
+      {/* ── ÉNERGIE + STATS  (au-dessus du TAP) ── */}
+      <div className="px-4 mb-4">
+        {/* Barre énergie */}
+        <div className="flex items-center justify-between mb-1.5">
+          <div className="flex items-center gap-1.5">
+            <span className="text-sm">⚡</span>
+            <span className="text-sm font-semibold text-white">{Math.floor(user.energy)}</span>
+            <span className="text-xs text-slate-500">/ {maxEnergy}</span>
+          </div>
+          <span className="text-xs text-slate-500">{Math.round(energyPercent)}%</span>
+        </div>
+        <div className="w-full h-2.5 rounded-full overflow-hidden mb-3"
+          style={{ background: '#12141f', border: '1px solid #1e2030' }}>
+          <motion.div
+            className={`h-full bg-gradient-to-r ${energyColor} rounded-full`}
+            animate={{ width: `${energyPercent}%` }}
+            transition={{ duration: 0.2 }}
+          />
+        </div>
+
+        {/* Stats */}
+        <div className="flex gap-2">
+          {[
+            { label: 'Level IA',   value: String(user.ai_level),       color: 'text-violet-300' },
+            { label: 'Total taps', value: formatRaw(user.total_taps),  color: 'text-white' },
+            { label: 'Referrals',  value: String(user.referral_count), color: 'text-green-400' },
+          ].map(({ label, value, color }) => (
+            <div key={label} className="flex-1 rounded-xl px-2 py-2 text-center"
+              style={{ background: '#12141f', border: '1px solid #1e2030' }}>
+              <p className="text-[9px] text-slate-500 mb-0.5">{label}</p>
+              <p className={`text-sm font-bold ${color}`}>{value}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── BOUTON TAP ── */}
       <div className="flex justify-center px-6">
         <motion.button
           onClick={handleTap}
           onTouchStart={handleTap}
           style={{
-            width: '272px', height: '272px', borderRadius: '50%',
+            width: '260px', height: '260px', borderRadius: '50%',
             background: 'radial-gradient(circle at 40% 35%, #1e1b40 0%, #0e0d1e 70%)',
             border: user.energy < 1 ? '3px solid #2a2d40' : '3px solid rgba(124,58,237,0.55)',
             boxShadow: user.energy < 1 ? 'none' : '0 0 32px rgba(109,40,217,0.22), inset 0 0 40px rgba(109,40,217,0.08)',
@@ -253,55 +258,20 @@ export default function GamePage() {
           disabled={user.energy < 1}
         >
           {user.energy >= 1 && (
-            <motion.div
-              className="absolute inset-[-5px] rounded-full"
+            <motion.div className="absolute inset-[-5px] rounded-full"
               style={{ border: '1.5px solid rgba(139,92,246,0.25)' }}
               animate={{ opacity: [0.2, 0.6, 0.2] }}
-              transition={{ duration: 2.5, repeat: Infinity }}
-            />
+              transition={{ duration: 2.5, repeat: Infinity }} />
           )}
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none" style={{ paddingBottom: '40px' }}>
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none"
+            style={{ paddingBottom: '40px' }}>
             <AiAvatar level={user.ai_level} type={user.ai_type} />
           </div>
-          <div className="absolute bottom-8 left-0 right-0 text-center pointer-events-none">
+          <div className="absolute bottom-7 left-0 right-0 text-center pointer-events-none">
             <p className="text-base font-bold text-white/90">{user.energy < 1 ? 'No energy' : 'Tap to train'}</p>
             {user.energy >= 1 && <p className="text-xs text-slate-400 mt-0.5">+1 coin per tap</p>}
           </div>
         </motion.button>
-      </div>
-
-      {/* BARRE ENERGIE */}
-      <div className="px-6 mt-5">
-        <div className="flex items-center justify-between mb-1.5">
-          <div className="flex items-center gap-1.5">
-            <span className="text-base">⚡</span>
-            <span className="text-sm font-semibold text-white">{Math.floor(user.energy)}</span>
-            <span className="text-xs text-slate-500">/ {maxEnergy}</span>
-          </div>
-          <span className="text-xs text-slate-500">{Math.round(energyPercent)}%</span>
-        </div>
-        <div className="w-full h-3 rounded-full overflow-hidden" style={{ background: '#12141f', border: '1px solid #1e2030' }}>
-          <motion.div
-            className={`h-full bg-gradient-to-r ${energyColor} rounded-full`}
-            animate={{ width: `${energyPercent}%` }}
-            transition={{ duration: 0.2 }}
-          />
-        </div>
-      </div>
-
-      {/* STATS */}
-      <div className="flex justify-center gap-3 px-4 mt-4">
-        {[
-          { label: 'Level IA',   value: String(user.ai_level),        color: 'text-violet-300' },
-          { label: 'Total taps', value: formatRaw(user.total_taps),   color: 'text-white' },
-          { label: 'Referrals',  value: String(user.referral_count),  color: 'text-green-400' },
-        ].map(({ label, value, color }) => (
-          <div key={label} className="flex-1 rounded-2xl px-3 py-2.5 text-center"
-            style={{ background: '#12141f', border: '1px solid #1e2030' }}>
-            <p className="text-[10px] text-slate-500 mb-0.5">{label}</p>
-            <p className={`text-base font-bold ${color}`}>{value}</p>
-          </div>
-        ))}
       </div>
 
       <AnimatePresence>
