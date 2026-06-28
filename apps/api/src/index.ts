@@ -21,8 +21,9 @@ import adRoutes from './routes/ads';
 import sponsorshipRoutes from './routes/sponsorships';
 import tokenRoutes from './routes/token';
 import cashoutRoutes from './routes/cashout';
+import avatarRoutes from './routes/avatar';
 
-// B2B API (separate router, no Telegram auth, uses API keys)
+// B2B API
 import b2bRoutes from './routes/v1/datasets';
 import clientRoutes from './routes/v1/clients';
 
@@ -32,14 +33,12 @@ import { startBot } from './bot';
 
 const app = new Hono();
 
-// Global middleware
 app.use('*', logger());
 app.use('*', cors({
   origin: env.FRONTEND_URL,
   credentials: true,
 }));
 
-// Health check
 app.get('/', (c) => c.json({
   status: 'ok',
   name: 'ai-kombat-api',
@@ -47,7 +46,6 @@ app.get('/', (c) => c.json({
   env: env.NODE_ENV,
 }));
 
-// Mount routes
 app.route('/api/auth', authRoutes);
 app.route('/api/tap', tapRoutes);
 app.route('/api/ai', aiRoutes);
@@ -60,32 +58,25 @@ app.route('/api/ads', adRoutes);
 app.route('/api/sponsorships', sponsorshipRoutes);
 app.route('/api/token', tokenRoutes);
 app.route('/api/cashout', cashoutRoutes);
+app.route('/api/avatar', avatarRoutes); // proxy avatar Telegram
 
 // B2B API
 app.route('/api/v1/datasets', b2bRoutes);
 app.route('/api/v1/account', clientRoutes);
 
-// 404
 app.notFound((c) => c.json({ error: 'Not found' }, 404));
-
-// Error handler
 app.onError((err, c) => {
   pinoLogger.error({ err }, 'Unhandled error');
   return c.json({ error: 'Internal server error' }, 500);
 });
 
-// Start server avec Bun natif
 const port = Number(env.PORT) || 3001;
-Bun.serve({
-  port,
-  fetch: app.fetch,
-});
+Bun.serve({ port, fetch: app.fetch });
 
 pinoLogger.info(`🚀 AI Kombat API running on http://localhost:${port}`);
 pinoLogger.info(`📱 Frontend URL: ${env.FRONTEND_URL}`);
 pinoLogger.info(`🌍 Environment: ${env.NODE_ENV}`);
 
-// Start background workers
 if (env.NODE_ENV === 'production') {
   startCrons();
   startBot();

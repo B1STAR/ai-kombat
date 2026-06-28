@@ -21,13 +21,20 @@ interface FloatingCoin {
 const formatRaw = (n: number): string =>
   Math.floor(n).toLocaleString('fr-FR').replace(/\u202f/g, '\u00a0');
 
+// URL du proxy avatar - evite le CORS de t.me
+const avatarProxyUrl = (telegramId: number) =>
+  `${process.env.NEXT_PUBLIC_API_URL || ''}/api/avatar/${telegramId}`;
+
 export default function GamePage() {
   const api = useApi();
   const { isTelegram, initData, isReady } = useTelegram();
   const { user, setUser, updateEnergy } = useGameStore();
+  const [avatarError, setAvatarError] = useState(false);
 
   const userRef = useRef(user);
   useEffect(() => { userRef.current = user; }, [user]);
+  // Reset erreur avatar si le user change
+  useEffect(() => { setAvatarError(false); }, [user?.telegram_id]);
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
   const [isTapping, setIsTapping] = useState(false);
@@ -91,7 +98,6 @@ export default function GamePage() {
     }
 
     hapticImpact('light');
-
     const energyDrain = 2.5;
     const newEnergy = Math.max(0, user.energy - energyDrain);
     updateEnergy(-energyDrain);
@@ -142,21 +148,28 @@ export default function GamePage() {
     : energyPercent > 20 ? 'from-yellow-500 to-orange-500'
     : 'from-red-700 to-red-500';
 
+  // Avatar : on tente le proxy, fallback sur l'initiale
+  const hasAvatar = !!user.photo_url && !avatarError;
+
   return (
     <div className="min-h-screen pb-20 flex flex-col" style={{ background: '#08090f' }}>
 
-      {/* ===== TOP BAR ===== */}
+      {/* TOP BAR */}
       <div className="flex items-center justify-between px-4 pt-4 pb-3">
-        {/* Avatar Telegram + infos */}
         <div className="flex items-center gap-3">
-          {user.photo_url ? (
+          {hasAvatar ? (
             <img
-              src={user.photo_url}
+              src={avatarProxyUrl(user.telegram_id)}
               alt={user.first_name}
-              className="w-11 h-11 rounded-full border-2 border-violet-500/50 object-cover"
+              className="w-11 h-11 rounded-full border-2 object-cover"
+              style={{ borderColor: 'rgba(124,58,237,0.6)' }}
+              onError={() => setAvatarError(true)}
             />
           ) : (
-            <div className="w-11 h-11 rounded-full border-2 border-violet-500/50 bg-violet-900/40 flex items-center justify-center">
+            <div
+              className="w-11 h-11 rounded-full flex items-center justify-center border-2"
+              style={{ background: 'rgba(109,40,217,0.25)', borderColor: 'rgba(124,58,237,0.5)' }}
+            >
               <span className="text-lg font-bold text-violet-300">
                 {user.first_name?.[0]?.toUpperCase() || 'A'}
               </span>
@@ -173,20 +186,19 @@ export default function GamePage() {
         </div>
 
         {/* Profit / heure */}
-        <div className="flex items-center gap-2 rounded-2xl px-3 py-2"
-          style={{ background: '#12141f', border: '1px solid #2a2d40' }}>
-          <div className="w-7 h-7 rounded-full bg-yellow-500/15 flex items-center justify-center">
+        <div
+          className="flex items-center gap-2 rounded-2xl px-3 py-2"
+          style={{ background: '#12141f', border: '1px solid #2a2d40' }}
+        >
+          <div className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: 'rgba(234,179,8,0.12)' }}>
             <TrendingUp className="w-4 h-4 text-yellow-400" />
           </div>
           <div>
             <p className="text-[10px] text-slate-500 leading-none">Profit / heure</p>
-            <p className="text-sm font-bold text-yellow-300 leading-tight">
-              +{formatRaw(user.passiveIncomePerHour)}
-            </p>
+            <p className="text-sm font-bold text-yellow-300 leading-tight">+{formatRaw(user.passiveIncomePerHour)}</p>
           </div>
         </div>
 
-        {/* Settings */}
         <button
           className="w-10 h-10 rounded-full flex items-center justify-center"
           style={{ background: '#12141f', border: '1px solid #2a2d40' }}
@@ -195,11 +207,11 @@ export default function GamePage() {
         </button>
       </div>
 
-      {/* ===== COINS ===== */}
+      {/* COINS */}
       <div className="flex justify-center items-center gap-3 pt-1 pb-3">
         <div
-          className="w-10 h-10 rounded-full flex items-center justify-center shadow-lg"
-          style={{ background: 'linear-gradient(135deg, #f59e0b, #d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}
+          className="w-10 h-10 rounded-full flex items-center justify-center"
+          style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}
         >
           <span className="text-lg">🪙</span>
         </div>
@@ -208,14 +220,11 @@ export default function GamePage() {
         </span>
       </div>
 
-      {/* ===== SÉPARATEUR ARC DORE style Hamster ===== */}
+      {/* SEPARATEUR ARC DORE */}
       <div className="relative w-full h-6 mb-1" aria-hidden>
         <svg viewBox="0 0 390 24" preserveAspectRatio="none" className="w-full h-full">
-          {/* Ombre douce en dessous */}
           <path d="M0,24 Q195,0 390,24" fill="none" stroke="rgba(180,130,40,0.18)" strokeWidth="8" />
-          {/* Ligne dorée principale */}
-          <path d="M0,24 Q195,0 390,24" fill="none"
-            stroke="url(#goldArc)" strokeWidth="2" strokeLinecap="round" />
+          <path d="M0,24 Q195,0 390,24" fill="none" stroke="url(#goldArc)" strokeWidth="2" strokeLinecap="round" />
           <defs>
             <linearGradient id="goldArc" x1="0" y1="0" x2="1" y2="0">
               <stop offset="0%" stopColor="transparent" />
@@ -228,28 +237,21 @@ export default function GamePage() {
         </svg>
       </div>
 
-      {/* ===== BOUTON TAP ===== */}
+      {/* BOUTON TAP */}
       <div className="flex justify-center px-6">
         <motion.button
           onClick={handleTap}
           onTouchStart={handleTap}
-          className={cn(
-            'relative w-68 h-68 rounded-full select-none touch-none',
-          )}
           style={{
-            width: '272px', height: '272px',
+            width: '272px', height: '272px', borderRadius: '50%',
             background: 'radial-gradient(circle at 40% 35%, #1e1b40 0%, #0e0d1e 70%)',
-            border: user.energy < 1
-              ? '3px solid #2a2d40'
-              : '3px solid rgba(124,58,237,0.55)',
-            boxShadow: user.energy < 1
-              ? 'none'
-              : '0 0 32px rgba(109,40,217,0.22), inset 0 0 40px rgba(109,40,217,0.08)',
+            border: user.energy < 1 ? '3px solid #2a2d40' : '3px solid rgba(124,58,237,0.55)',
+            boxShadow: user.energy < 1 ? 'none' : '0 0 32px rgba(109,40,217,0.22), inset 0 0 40px rgba(109,40,217,0.08)',
           }}
+          className="relative select-none touch-none"
           whileTap={{ scale: 0.93 }}
           disabled={user.energy < 1}
         >
-          {/* Anneau pulse */}
           {user.energy >= 1 && (
             <motion.div
               className="absolute inset-[-5px] rounded-full"
@@ -258,25 +260,17 @@ export default function GamePage() {
               transition={{ duration: 2.5, repeat: Infinity }}
             />
           )}
-
-          {/* Avatar IA centré dans le cercle */}
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none" style={{ paddingBottom: '40px' }}>
             <AiAvatar level={user.ai_level} type={user.ai_type} />
           </div>
-
-          {/* Texte bas du cercle */}
           <div className="absolute bottom-8 left-0 right-0 text-center pointer-events-none">
-            <p className="text-base font-bold text-white/90">
-              {user.energy < 1 ? 'No energy' : 'Tap to train'}
-            </p>
-            {user.energy >= 1 && (
-              <p className="text-xs text-slate-400 mt-0.5">+1 coin per tap</p>
-            )}
+            <p className="text-base font-bold text-white/90">{user.energy < 1 ? 'No energy' : 'Tap to train'}</p>
+            {user.energy >= 1 && <p className="text-xs text-slate-400 mt-0.5">+1 coin per tap</p>}
           </div>
         </motion.button>
       </div>
 
-      {/* ===== BARRE ENERGIE ===== */}
+      {/* BARRE ENERGIE */}
       <div className="px-6 mt-5">
         <div className="flex items-center justify-between mb-1.5">
           <div className="flex items-center gap-1.5">
@@ -286,10 +280,7 @@ export default function GamePage() {
           </div>
           <span className="text-xs text-slate-500">{Math.round(energyPercent)}%</span>
         </div>
-        <div
-          className="w-full h-3 rounded-full overflow-hidden"
-          style={{ background: '#12141f', border: '1px solid #1e2030' }}
-        >
+        <div className="w-full h-3 rounded-full overflow-hidden" style={{ background: '#12141f', border: '1px solid #1e2030' }}>
           <motion.div
             className={`h-full bg-gradient-to-r ${energyColor} rounded-full`}
             animate={{ width: `${energyPercent}%` }}
@@ -298,18 +289,15 @@ export default function GamePage() {
         </div>
       </div>
 
-      {/* ===== STATS SECONDAIRES ===== */}
+      {/* STATS */}
       <div className="flex justify-center gap-3 px-4 mt-4">
         {[
-          { label: 'Level IA',    value: String(user.ai_level),             color: 'text-violet-300' },
-          { label: 'Total taps',  value: formatRaw(user.total_taps),        color: 'text-white' },
-          { label: 'Referrals',   value: String(user.referral_count),       color: 'text-green-400' },
+          { label: 'Level IA',   value: String(user.ai_level),        color: 'text-violet-300' },
+          { label: 'Total taps', value: formatRaw(user.total_taps),   color: 'text-white' },
+          { label: 'Referrals',  value: String(user.referral_count),  color: 'text-green-400' },
         ].map(({ label, value, color }) => (
-          <div
-            key={label}
-            className="flex-1 rounded-2xl px-3 py-2.5 text-center"
-            style={{ background: '#12141f', border: '1px solid #1e2030' }}
-          >
+          <div key={label} className="flex-1 rounded-2xl px-3 py-2.5 text-center"
+            style={{ background: '#12141f', border: '1px solid #1e2030' }}>
             <p className="text-[10px] text-slate-500 mb-0.5">{label}</p>
             <p className={`text-base font-bold ${color}`}>{value}</p>
           </div>
