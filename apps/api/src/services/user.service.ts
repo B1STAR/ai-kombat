@@ -35,10 +35,6 @@ export interface User {
   ban_reason: string | null;
 }
 
-/**
- * PostgreSQL retourne les colonnes BIGINT comme string en JS via Knex.
- * Cette fonction normalise tous les champs numeriques critiques d'un user.
- */
 export const normalizeUser = (user: any): User => ({
   ...user,
   coin_balance: Number(user.coin_balance),
@@ -54,7 +50,6 @@ export const normalizeUser = (user: any): User => ({
 
 export const upsertUser = async (parsed: InitDataParsed): Promise<User> => {
   if (!parsed.user) throw new Error('No user in initData');
-  
   const [user] = await db<User>('users')
     .insert({
       telegram_id: parsed.user.id,
@@ -69,7 +64,6 @@ export const upsertUser = async (parsed: InitDataParsed): Promise<User> => {
     .onConflict('telegram_id')
     .merge(['first_name', 'last_name', 'username', 'photo_url', 'is_premium', 'language_code', 'last_active_at'])
     .returning('*');
-  
   return normalizeUser(user);
 };
 
@@ -78,10 +72,14 @@ export const getUserByTelegramId = async (telegramId: number): Promise<User | nu
   return user ? normalizeUser(user) : null;
 };
 
+/**
+ * Calcule l'energie regeneree depuis la derniere mise a jour.
+ * Regen : 1 point toutes les 3 secondes (0.333/s) — 3x plus lent qu'avant.
+ */
 export const calculateValidEnergy = (user: User, now: Date = new Date()): number => {
   const lastUpdate = new Date(user.last_energy_update);
   const secondsPassed = Math.floor((now.getTime() - lastUpdate.getTime()) / 1000);
-  const regenPerSecond = 1;
+  const regenPerSecond = 1 / 3; // 3x plus lent
   const newEnergy = Number(user.energy) + (secondsPassed * regenPerSecond);
   return Math.min(newEnergy, Number(user.max_energy));
 };
@@ -92,9 +90,7 @@ export const addCoins = async (userId: number, amount: number, type: string, rel
     .increment('coin_balance', amount)
     .increment('total_earned_coins', amount > 0 ? amount : 0)
     .returning('coin_balance');
-  
   const newBalance = Number(updated.coin_balance);
-
   await db('transactions').insert({
     user_id: userId,
     type,
@@ -104,23 +100,18 @@ export const addCoins = async (userId: number, amount: number, type: string, rel
     related_entity_type: relatedEntity?.type || null,
     related_entity_id: relatedEntity?.id || null,
   });
-  
   return newBalance;
 };
 
 export const spendCoins = async (userId: number, amount: number, type: string, relatedEntity?: { type: string; id: number }): Promise<number> => {
   const user = await getUserByTelegramId(userId);
   if (!user) throw new Error('User not found');
-  // normalizeUser garantit que coin_balance est un Number
   if (user.coin_balance < amount) throw new Error('Insufficient coins');
-  
   const [updated] = await db<User>('users')
     .where({ telegram_id: userId })
     .decrement('coin_balance', amount)
     .returning('coin_balance');
-  
   const newBalance = Number(updated.coin_balance);
-
   await db('transactions').insert({
     user_id: userId,
     type,
@@ -130,7 +121,6 @@ export const spendCoins = async (userId: number, amount: number, type: string, r
     related_entity_type: relatedEntity?.type || null,
     related_entity_id: relatedEntity?.id || null,
   });
-  
   return newBalance;
 };
 
@@ -139,16 +129,13 @@ export const getUserProgress = async (userId: number) => {
     .where({ user_id: userId, is_completed: false })
     .join('quests', 'quests.id', 'user_quests.quest_id')
     .select('user_quests.*', 'quests.name', 'quests.description', 'quests.reward_coins', 'quests.target_count');
-  
   const ownedModules = await db('user_modules')
     .where({ user_id: userId })
     .join('ai_modules', 'ai_modules.id', 'user_modules.module_id')
     .select('user_modules.*', 'ai_modules.code', 'ai_modules.name', 'ai_modules.coins_per_hour_bonus');
-  
   const achievements = await db('user_achievements')
     .where({ user_id: userId })
     .join('achievements', 'achievements.id', 'user_achievements.achievement_id')
     .select('user_achievements.*', 'achievements.name', 'achievements.icon_url');
-  
   return { activeQuests, ownedModules, achievements };
 };
