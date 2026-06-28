@@ -1,83 +1,77 @@
 /**
- * AI Kombat - Backend entry point
- * Bun + Hono + TypeScript
+ * Entry point — Bun + Hono API server.
+ * startBot et startCrons wrappés dans try/catch avec exit code non-zero
+ * pour que PM2/Fly.io redémarre automatiquement en cas de crash.
  */
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { logger } from 'hono/logger';
+import { logger as honoLogger } from 'hono/logger';
 import { env } from './lib/env';
-import { logger as pinoLogger } from './lib/logger';
-
-// Routes
-import authRoutes from './routes/auth';
-import tapRoutes from './routes/tap';
-import aiRoutes from './routes/ai';
-import moduleRoutes from './routes/modules';
-import questRoutes from './routes/quests';
-import taskRoutes from './routes/tasks';
-import referralRoutes from './routes/referral';
-import leaderboardRoutes from './routes/leaderboard';
-import adRoutes from './routes/ads';
-import sponsorshipRoutes from './routes/sponsorships';
-import tokenRoutes from './routes/token';
-import cashoutRoutes from './routes/cashout';
-import avatarRoutes from './routes/avatar';
-
-// B2B API
-import b2bRoutes from './routes/v1/datasets';
-import clientRoutes from './routes/v1/clients';
-
-// Workers
+import { logger } from './lib/logger';
 import { startCrons } from './workers/cron';
 import { startBot } from './bot';
 
+import auth from './routes/auth';
+import tap from './routes/tap';
+import ai from './routes/ai';
+import modules from './routes/modules';
+import quests from './routes/quests';
+import tasks from './routes/tasks';
+import referral from './routes/referral';
+import leaderboard from './routes/leaderboard';
+import ads from './routes/ads';
+import cashout from './routes/cashout';
+import token from './routes/token';
+import v1 from './routes/v1';
+
 const app = new Hono();
 
-app.use('*', logger());
 app.use('*', cors({
-  origin: env.FRONTEND_URL,
+  origin: env.ALLOWED_ORIGINS?.split(',') ?? ['*'],
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
 
-app.get('/', (c) => c.json({
-  status: 'ok',
-  name: 'ai-kombat-api',
-  version: '0.1.0',
-  env: env.NODE_ENV,
-}));
+app.use('*', honoLogger());
 
-app.route('/api/auth', authRoutes);
-app.route('/api/tap', tapRoutes);
-app.route('/api/ai', aiRoutes);
-app.route('/api/modules', moduleRoutes);
-app.route('/api/quests', questRoutes);
-app.route('/api/tasks', taskRoutes);
-app.route('/api/referral', referralRoutes);
-app.route('/api/leaderboard', leaderboardRoutes);
-app.route('/api/ads', adRoutes);
-app.route('/api/sponsorships', sponsorshipRoutes);
-app.route('/api/token', tokenRoutes);
-app.route('/api/cashout', cashoutRoutes);
-app.route('/api/avatar', avatarRoutes); // proxy avatar Telegram
+app.get('/health', (c) => c.json({ status: 'ok', ts: new Date().toISOString() }));
 
-// B2B API
-app.route('/api/v1/datasets', b2bRoutes);
-app.route('/api/v1/account', clientRoutes);
-
-app.notFound((c) => c.json({ error: 'Not found' }, 404));
-app.onError((err, c) => {
-  pinoLogger.error({ err }, 'Unhandled error');
-  return c.json({ error: 'Internal server error' }, 500);
-});
-
-const port = Number(env.PORT) || 3001;
-Bun.serve({ port, fetch: app.fetch });
-
-pinoLogger.info(`🚀 AI Kombat API running on http://localhost:${port}`);
-pinoLogger.info(`📱 Frontend URL: ${env.FRONTEND_URL}`);
-pinoLogger.info(`🌍 Environment: ${env.NODE_ENV}`);
+app.route('/api/auth', auth);
+app.route('/api/tap', tap);
+app.route('/api/ai', ai);
+app.route('/api/modules', modules);
+app.route('/api/quests', quests);
+app.route('/api/tasks', tasks);
+app.route('/api/referral', referral);
+app.route('/api/leaderboard', leaderboard);
+app.route('/api/ads', ads);
+app.route('/api/cashout', cashout);
+app.route('/api/token', token);
+app.route('/api/v1', v1);
 
 if (env.NODE_ENV === 'production') {
-  startCrons();
-  startBot();
+  try {
+    startCrons();
+    logger.info('✅ Cron jobs started');
+  } catch (err) {
+    logger.fatal({ err }, '❌ startCrons failed — exiting');
+    process.exit(1);
+  }
+
+  try {
+    startBot();
+    logger.info('✅ Telegram bot started');
+  } catch (err) {
+    logger.fatal({ err }, '❌ startBot failed — exiting');
+    process.exit(1);
+  }
 }
+
+const port = Number(env.PORT ?? 3001);
+logger.info(`🚀 Server listening on port ${port}`);
+
+export default {
+  port,
+  fetch: app.fetch,
+};

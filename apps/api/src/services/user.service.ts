@@ -36,6 +36,36 @@ export interface User {
   ban_reason: string | null;
 }
 
+/** Champs publics exposés au frontend — les champs internes sont filtrés */
+export type UserDTO = Pick<User,
+  | 'telegram_id' | 'first_name' | 'last_name' | 'username' | 'photo_url'
+  | 'coin_balance' | 'gem_balance' | 'energy' | 'max_energy'
+  | 'ai_name' | 'ai_level' | 'ai_xp' | 'ai_type'
+  | 'total_taps' | 'total_earned_coins'
+  | 'referral_count' | 'daily_streak' | 'is_premium'
+>;
+
+export const toUserDTO = (user: User): UserDTO => ({
+  telegram_id: user.telegram_id,
+  first_name: user.first_name,
+  last_name: user.last_name,
+  username: user.username,
+  photo_url: user.photo_url,
+  coin_balance: user.coin_balance,
+  gem_balance: user.gem_balance,
+  energy: user.energy,
+  max_energy: user.max_energy,
+  ai_name: user.ai_name,
+  ai_level: user.ai_level,
+  ai_xp: user.ai_xp,
+  ai_type: user.ai_type,
+  total_taps: user.total_taps,
+  total_earned_coins: user.total_earned_coins,
+  referral_count: user.referral_count,
+  daily_streak: user.daily_streak,
+  is_premium: user.is_premium,
+});
+
 export const normalizeUser = (user: any): User => ({
   ...user,
   coin_balance: Number(user.coin_balance),
@@ -77,19 +107,17 @@ export const getUserByTelegramId = async (telegramId: number): Promise<User | nu
  * Calcule l'energie actuelle en tenant compte de la regen progressive.
  * - Si energy_exhausted_at est set, la regen ne commence QU'APRES 30s d'attente.
  * - Regen : 1 point / 3 secondes (0.333/s).
- * Retourne un entier (floor) pour eviter les floats en DB.
  */
 export const calculateValidEnergy = (user: User, now: Date = new Date()): number => {
-  const REGEN_DELAY_AFTER_EXHAUSTION_MS = 30_000; // 30s avant de recharger apres epuisement
+  const REGEN_DELAY_AFTER_EXHAUSTION_MS = 30_000;
   const REGEN_PER_SECOND = 1 / 3;
 
   let regenStartTime: Date;
 
   if (user.energy_exhausted_at) {
-    // Energie epuisee : on attend 30s avant de commencer a recharger
     const exhaustedAt = new Date(user.energy_exhausted_at);
     regenStartTime = new Date(exhaustedAt.getTime() + REGEN_DELAY_AFTER_EXHAUSTION_MS);
-    if (now < regenStartTime) return 0; // Toujours en cooldown
+    if (now < regenStartTime) return 0;
   } else {
     regenStartTime = new Date(user.last_energy_update);
   }
@@ -119,15 +147,22 @@ export const addCoins = async (userId: number, amount: number, type: string, rel
   return newBalance;
 };
 
+/**
+ * spendCoins — UPDATE ATOMIQUE avec whereRaw coin_balance >= amount.
+ * Evite le double-spend si deux requetes arrivent en meme temps.
+ */
 export const spendCoins = async (userId: number, amount: number, type: string, relatedEntity?: { type: string; id: number }): Promise<number> => {
-  const user = await getUserByTelegramId(userId);
-  if (!user) throw new Error('User not found');
-  if (user.coin_balance < amount) throw new Error('Insufficient coins');
-  const [updated] = await db<User>('users')
+  const updated = await db<User>('users')
     .where({ telegram_id: userId })
+    .whereRaw('coin_balance >= ?', [amount])
     .decrement('coin_balance', amount)
     .returning('coin_balance');
-  const newBalance = Number(updated.coin_balance);
+
+  if (!updated || updated.length === 0) {
+    throw new Error('Insufficient coins');
+  }
+
+  const newBalance = Number(updated[0].coin_balance);
   await db('transactions').insert({
     user_id: userId,
     type,
@@ -140,18 +175,24 @@ export const spendCoins = async (userId: number, amount: number, type: string, r
   return newBalance;
 };
 
+/**
+ * getUserProgress — 3 requetes en PARALLELE via Promise.all.
+ * Divise la latence par ~3 sur /api/auth/init.
+ */
 export const getUserProgress = async (userId: number) => {
-  const activeQuests = await db('user_quests')
-    .where({ user_id: userId, is_completed: false })
-    .join('quests', 'quests.id', 'user_quests.quest_id')
-    .select('user_quests.*', 'quests.name', 'quests.description', 'quests.reward_coins', 'quests.target_count');
-  const ownedModules = await db('user_modules')
-    .where({ user_id: userId })
-    .join('ai_modules', 'ai_modules.id', 'user_modules.module_id')
-    .select('user_modules.*', 'ai_modules.code', 'ai_modules.name', 'ai_modules.coins_per_hour_bonus');
-  const achievements = await db('user_achievements')
-    .where({ user_id: userId })
-    .join('achievements', 'achievements.id', 'user_achievements.achievement_id')
-    .select('user_achievements.*', 'achievements.name', 'achievements.icon_url');
+  const [activeQuests, ownedModules, achievements] = await Promise.all([
+    db('user_quests')
+      .where({ user_id: userId, is_completed: false })
+      .join('quests', 'quests.id', 'user_quests.quest_id')
+      .select('user_quests.*', 'quests.name', 'quests.description', 'quests.reward_coins', 'quests.target_count'),
+    db('user_modules')
+      .where({ user_id: userId })
+      .join('ai_modules', 'ai_modules.id', 'user_modules.module_id')
+      .select('user_modules.*', 'ai_modules.code', 'ai_modules.name', 'ai_modules.coins_per_hour_bonus'),
+    db('user_achievements')
+      .where({ user_id: userId })
+      .join('achievements', 'achievements.id', 'user_achievements.achievement_id')
+      .select('user_achievements.*', 'achievements.name', 'achievements.icon_url'),
+  ]);
   return { activeQuests, ownedModules, achievements };
 };
