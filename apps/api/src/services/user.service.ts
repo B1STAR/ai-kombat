@@ -36,16 +36,17 @@ export interface User {
   ban_reason: string | null;
 }
 
-/** Champs publics exposés au frontend — les champs internes sont filtrés */
+/** Champs publics exposés au frontend — les champs internes sensibles sont filtrés */
 export type UserDTO = Pick<User,
-  | 'telegram_id' | 'first_name' | 'last_name' | 'username' | 'photo_url'
+  | 'id' | 'telegram_id' | 'first_name' | 'last_name' | 'username' | 'photo_url'
   | 'coin_balance' | 'gem_balance' | 'energy' | 'max_energy'
   | 'ai_name' | 'ai_level' | 'ai_xp' | 'ai_type'
   | 'total_taps' | 'total_earned_coins'
-  | 'referral_count' | 'daily_streak' | 'is_premium'
+  | 'referred_by' | 'referral_count' | 'daily_streak' | 'is_premium'
 >;
 
 export const toUserDTO = (user: User): UserDTO => ({
+  id: user.id,
   telegram_id: user.telegram_id,
   first_name: user.first_name,
   last_name: user.last_name,
@@ -61,6 +62,7 @@ export const toUserDTO = (user: User): UserDTO => ({
   ai_type: user.ai_type,
   total_taps: user.total_taps,
   total_earned_coins: user.total_earned_coins,
+  referred_by: user.referred_by,
   referral_count: user.referral_count,
   daily_streak: user.daily_streak,
   is_premium: user.is_premium,
