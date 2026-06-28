@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Brain, Settings, TrendingUp, Users } from 'lucide-react';
+import { Brain, Settings, TrendingUp } from 'lucide-react';
 import { useGameStore } from '@/lib/store';
 import { useApi } from '@/lib/api';
 import { useTelegram } from '@/lib/telegram';
@@ -18,10 +18,8 @@ interface FloatingCoin {
   amount: number;
 }
 
-// Formate en chiffres bruts avec espaces : 22 750 065
-const formatRaw = (n: number): string => {
-  return Math.floor(n).toLocaleString('fr-FR').replace(/\u202f/g, '\u00a0');
-};
+const formatRaw = (n: number): string =>
+  Math.floor(n).toLocaleString('fr-FR').replace(/\u202f/g, '\u00a0');
 
 export default function GamePage() {
   const api = useApi();
@@ -41,7 +39,6 @@ export default function GamePage() {
   useEffect(() => {
     if (!isReady) return;
     if (isTelegram && !initData) return;
-
     const init = async () => {
       try {
         const tgStartParam =
@@ -68,7 +65,6 @@ export default function GamePage() {
     init();
   }, [isReady, initData]);
 
-  // Regen energie passif - 1 point / seconde
   useEffect(() => {
     if (!user) return;
     const interval = setInterval(() => { updateEnergy(1); }, 1000);
@@ -96,7 +92,6 @@ export default function GamePage() {
 
     hapticImpact('light');
 
-    // Drain 2.5x : chaque tap consomme 2.5 energy (arrondi au-dessus)
     const energyDrain = 2.5;
     const newEnergy = Math.max(0, user.energy - energyDrain);
     updateEnergy(-energyDrain);
@@ -114,33 +109,27 @@ export default function GamePage() {
       const optimisticCoins = optimisticAddedRef.current;
       tapPendingCountRef.current = 0;
       optimisticAddedRef.current = 0;
-
       try {
         const response = await api.post<any>('/api/tap', {
           count: batchCount,
           clientTimestamp: new Date().toISOString(),
         });
         const currentUser = userRef.current;
-        if (currentUser) {
-          setUser({ ...currentUser, coin_balance: response.newBalance, energy: response.newEnergy });
-        }
+        if (currentUser) setUser({ ...currentUser, coin_balance: response.newBalance, energy: response.newEnergy });
         if (response.aiLevelUp) hapticNotification('success');
       } catch (err) {
-        console.error('Tap failed:', err);
         const currentUser = userRef.current;
-        if (currentUser) {
-          setUser({ ...currentUser, coin_balance: currentUser.coin_balance - optimisticCoins });
-        }
+        if (currentUser) setUser({ ...currentUser, coin_balance: currentUser.coin_balance - optimisticCoins });
       }
     }, 600);
   };
 
   if (!user) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-dark-950">
+      <div className="min-h-screen flex items-center justify-center" style={{ background: '#08090f' }}>
         <div className="text-center">
-          <Brain className="w-16 h-16 mx-auto text-accent-500 animate-pulse mb-4" />
-          <p className="text-dark-300 text-sm">Loading your AI...</p>
+          <Brain className="w-16 h-16 mx-auto text-violet-500 animate-pulse mb-4" />
+          <p className="text-slate-400 text-sm">Loading your AI...</p>
         </div>
       </div>
     );
@@ -148,41 +137,49 @@ export default function GamePage() {
 
   const maxEnergy = user.max_energy || 1000;
   const energyPercent = Math.min(100, (user.energy / maxEnergy) * 100);
-  const energyColor = energyPercent > 50
-    ? 'from-blue-500 to-accent-500'
-    : energyPercent > 20
-    ? 'from-yellow-500 to-orange-400'
-    : 'from-red-600 to-red-400';
+  const energyColor =
+    energyPercent > 50 ? 'from-blue-600 to-violet-500'
+    : energyPercent > 20 ? 'from-yellow-500 to-orange-500'
+    : 'from-red-700 to-red-500';
 
   return (
-    <div className="min-h-screen pb-20 flex flex-col bg-gradient-to-b from-[#0a0e1a] via-[#0d1225] to-[#0a0e1a]">
+    <div className="min-h-screen pb-20 flex flex-col" style={{ background: '#08090f' }}>
 
-      {/* ===== TOP BAR style Hamster Kombat ===== */}
-      <div className="flex items-center justify-between px-4 pt-4 pb-2">
-        {/* Avatar + Nom */}
+      {/* ===== TOP BAR ===== */}
+      <div className="flex items-center justify-between px-4 pt-4 pb-3">
+        {/* Avatar Telegram + infos */}
         <div className="flex items-center gap-3">
-          <div className="w-11 h-11 rounded-full bg-accent-500/30 border-2 border-accent-500/50 flex items-center justify-center">
-            <span className="text-lg font-bold text-accent-300">
-              {user.first_name?.[0]?.toUpperCase() || 'A'}
-            </span>
-          </div>
+          {user.photo_url ? (
+            <img
+              src={user.photo_url}
+              alt={user.first_name}
+              className="w-11 h-11 rounded-full border-2 border-violet-500/50 object-cover"
+            />
+          ) : (
+            <div className="w-11 h-11 rounded-full border-2 border-violet-500/50 bg-violet-900/40 flex items-center justify-center">
+              <span className="text-lg font-bold text-violet-300">
+                {user.first_name?.[0]?.toUpperCase() || 'A'}
+              </span>
+            </div>
+          )}
           <div>
             <p className="text-sm font-bold text-white leading-tight">
               {user.first_name} {user.last_name || ''}
             </p>
-            <p className="text-xs text-dark-300 leading-tight capitalize">
-              {user.ai_type} {user.ai_level} / 100
+            <p className="text-xs text-slate-400 leading-tight capitalize">
+              {user.ai_type} &bull; Level {user.ai_level}
             </p>
           </div>
         </div>
 
-        {/* Profit per hour — style Hamster */}
-        <div className="flex items-center gap-2 bg-dark-800/80 border border-dark-600 rounded-2xl px-3 py-2">
-          <div className="w-7 h-7 rounded-full bg-yellow-500/20 flex items-center justify-center">
+        {/* Profit / heure */}
+        <div className="flex items-center gap-2 rounded-2xl px-3 py-2"
+          style={{ background: '#12141f', border: '1px solid #2a2d40' }}>
+          <div className="w-7 h-7 rounded-full bg-yellow-500/15 flex items-center justify-center">
             <TrendingUp className="w-4 h-4 text-yellow-400" />
           </div>
-          <div className="text-right">
-            <p className="text-[10px] text-dark-400 leading-none">Profit / heure</p>
+          <div>
+            <p className="text-[10px] text-slate-500 leading-none">Profit / heure</p>
             <p className="text-sm font-bold text-yellow-300 leading-tight">
               +{formatRaw(user.passiveIncomePerHour)}
             </p>
@@ -190,14 +187,20 @@ export default function GamePage() {
         </div>
 
         {/* Settings */}
-        <button className="w-10 h-10 rounded-full bg-dark-800 border border-dark-600 flex items-center justify-center">
-          <Settings className="w-5 h-5 text-dark-300" />
+        <button
+          className="w-10 h-10 rounded-full flex items-center justify-center"
+          style={{ background: '#12141f', border: '1px solid #2a2d40' }}
+        >
+          <Settings className="w-5 h-5 text-slate-400" />
         </button>
       </div>
 
-      {/* ===== COINS bruts style Hamster ===== */}
-      <div className="flex justify-center items-center gap-3 pt-3 pb-4">
-        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-yellow-400 to-yellow-600 flex items-center justify-center shadow-lg shadow-yellow-500/30">
+      {/* ===== COINS ===== */}
+      <div className="flex justify-center items-center gap-3 pt-1 pb-3">
+        <div
+          className="w-10 h-10 rounded-full flex items-center justify-center shadow-lg"
+          style={{ background: 'linear-gradient(135deg, #f59e0b, #d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}
+        >
           <span className="text-lg">🪙</span>
         </div>
         <span className="text-4xl font-extrabold text-white tracking-tight">
@@ -205,61 +208,88 @@ export default function GamePage() {
         </span>
       </div>
 
-      {/* ===== BOUTON TAP — l'avatar vit A L'INTERIEUR ===== */}
-      <div className="flex justify-center px-6 flex-1">
+      {/* ===== SÉPARATEUR ARC DORE style Hamster ===== */}
+      <div className="relative w-full h-6 mb-1" aria-hidden>
+        <svg viewBox="0 0 390 24" preserveAspectRatio="none" className="w-full h-full">
+          {/* Ombre douce en dessous */}
+          <path d="M0,24 Q195,0 390,24" fill="none" stroke="rgba(180,130,40,0.18)" strokeWidth="8" />
+          {/* Ligne dorée principale */}
+          <path d="M0,24 Q195,0 390,24" fill="none"
+            stroke="url(#goldArc)" strokeWidth="2" strokeLinecap="round" />
+          <defs>
+            <linearGradient id="goldArc" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0%" stopColor="transparent" />
+              <stop offset="25%" stopColor="#c9963a" />
+              <stop offset="50%" stopColor="#f0c060" />
+              <stop offset="75%" stopColor="#c9963a" />
+              <stop offset="100%" stopColor="transparent" />
+            </linearGradient>
+          </defs>
+        </svg>
+      </div>
+
+      {/* ===== BOUTON TAP ===== */}
+      <div className="flex justify-center px-6">
         <motion.button
           onClick={handleTap}
           onTouchStart={handleTap}
           className={cn(
-            'relative w-72 h-72 rounded-full select-none touch-none',
-            'bg-gradient-to-br from-[#1a1f3c] via-[#141830] to-[#0e1228]',
-            'border-[3px]',
-            user.energy < 1
-              ? 'border-dark-600 opacity-60'
-              : 'border-accent-500/60 shadow-[0_0_40px_rgba(139,92,246,0.25)]',
+            'relative w-68 h-68 rounded-full select-none touch-none',
           )}
+          style={{
+            width: '272px', height: '272px',
+            background: 'radial-gradient(circle at 40% 35%, #1e1b40 0%, #0e0d1e 70%)',
+            border: user.energy < 1
+              ? '3px solid #2a2d40'
+              : '3px solid rgba(124,58,237,0.55)',
+            boxShadow: user.energy < 1
+              ? 'none'
+              : '0 0 32px rgba(109,40,217,0.22), inset 0 0 40px rgba(109,40,217,0.08)',
+          }}
           whileTap={{ scale: 0.93 }}
           disabled={user.energy < 1}
         >
-          {/* Anneau lumineux externe */}
+          {/* Anneau pulse */}
           {user.energy >= 1 && (
             <motion.div
-              className="absolute inset-[-4px] rounded-full border-2 border-accent-400/30"
-              animate={{ opacity: [0.3, 0.7, 0.3] }}
+              className="absolute inset-[-5px] rounded-full"
+              style={{ border: '1.5px solid rgba(139,92,246,0.25)' }}
+              animate={{ opacity: [0.2, 0.6, 0.2] }}
               transition={{ duration: 2.5, repeat: Infinity }}
             />
           )}
 
-          {/* Avatar IA — DANS le bouton tap */}
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          {/* Avatar IA centré dans le cercle */}
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none" style={{ paddingBottom: '40px' }}>
             <AiAvatar level={user.ai_level} type={user.ai_type} />
           </div>
 
-          {/* Texte en bas du cercle */}
-          <div className="absolute bottom-7 left-0 right-0 text-center pointer-events-none">
+          {/* Texte bas du cercle */}
+          <div className="absolute bottom-8 left-0 right-0 text-center pointer-events-none">
             <p className="text-base font-bold text-white/90">
               {user.energy < 1 ? 'No energy' : 'Tap to train'}
             </p>
             {user.energy >= 1 && (
-              <p className="text-xs text-dark-300 mt-0.5">+1 coin per tap</p>
+              <p className="text-xs text-slate-400 mt-0.5">+1 coin per tap</p>
             )}
           </div>
         </motion.button>
       </div>
 
       {/* ===== BARRE ENERGIE ===== */}
-      <div className="px-6 mt-5 mb-2">
+      <div className="px-6 mt-5">
         <div className="flex items-center justify-between mb-1.5">
           <div className="flex items-center gap-1.5">
             <span className="text-base">⚡</span>
-            <span className="text-sm font-semibold text-white">
-              {Math.floor(user.energy)}
-            </span>
-            <span className="text-xs text-dark-400">/ {maxEnergy}</span>
+            <span className="text-sm font-semibold text-white">{Math.floor(user.energy)}</span>
+            <span className="text-xs text-slate-500">/ {maxEnergy}</span>
           </div>
-          <span className="text-xs text-dark-400">{Math.round(energyPercent)}%</span>
+          <span className="text-xs text-slate-500">{Math.round(energyPercent)}%</span>
         </div>
-        <div className="w-full h-3 bg-dark-700/80 rounded-full overflow-hidden border border-dark-600">
+        <div
+          className="w-full h-3 rounded-full overflow-hidden"
+          style={{ background: '#12141f', border: '1px solid #1e2030' }}
+        >
           <motion.div
             className={`h-full bg-gradient-to-r ${energyColor} rounded-full`}
             animate={{ width: `${energyPercent}%` }}
@@ -269,19 +299,21 @@ export default function GamePage() {
       </div>
 
       {/* ===== STATS SECONDAIRES ===== */}
-      <div className="flex justify-center gap-3 px-4 mt-4 mb-2">
-        <div className="flex-1 bg-dark-800/60 border border-dark-600 rounded-2xl px-3 py-2.5 text-center">
-          <p className="text-[10px] text-dark-400 mb-0.5">Level IA</p>
-          <p className="text-base font-bold text-accent-300">{user.ai_level}</p>
-        </div>
-        <div className="flex-1 bg-dark-800/60 border border-dark-600 rounded-2xl px-3 py-2.5 text-center">
-          <p className="text-[10px] text-dark-400 mb-0.5">Total taps</p>
-          <p className="text-base font-bold text-white">{formatRaw(user.total_taps)}</p>
-        </div>
-        <div className="flex-1 bg-dark-800/60 border border-dark-600 rounded-2xl px-3 py-2.5 text-center">
-          <p className="text-[10px] text-dark-400 mb-0.5">Referrals</p>
-          <p className="text-base font-bold text-green-400">{user.referral_count}</p>
-        </div>
+      <div className="flex justify-center gap-3 px-4 mt-4">
+        {[
+          { label: 'Level IA',    value: String(user.ai_level),             color: 'text-violet-300' },
+          { label: 'Total taps',  value: formatRaw(user.total_taps),        color: 'text-white' },
+          { label: 'Referrals',   value: String(user.referral_count),       color: 'text-green-400' },
+        ].map(({ label, value, color }) => (
+          <div
+            key={label}
+            className="flex-1 rounded-2xl px-3 py-2.5 text-center"
+            style={{ background: '#12141f', border: '1px solid #1e2030' }}
+          >
+            <p className="text-[10px] text-slate-500 mb-0.5">{label}</p>
+            <p className={`text-base font-bold ${color}`}>{value}</p>
+          </div>
+        ))}
       </div>
 
       <AnimatePresence>
