@@ -2,13 +2,13 @@
 
 /**
  * Telegram SDK provider.
- * The SDK script is loaded synchronously in layout.tsx <head> so
- * window.Telegram.WebApp is guaranteed to exist before this useEffect runs.
+ * Expose aussi startParam (start_param) pour le referral.
  */
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
 
 interface TelegramContextValue {
   initData: string;
+  startParam: string;  // ref_XXXXXXX ou '' si absent
   user: {
     id: number;
     firstName: string;
@@ -20,6 +20,7 @@ interface TelegramContextValue {
 
 const TelegramContext = createContext<TelegramContextValue>({
   initData: '',
+  startParam: '',
   user: null,
   isReady: false,
   isTelegram: false,
@@ -30,6 +31,7 @@ export const useTelegram = () => useContext(TelegramContext);
 export function TelegramProvider({ children }: { children: ReactNode }) {
   const [isReady, setIsReady] = useState(false);
   const [initData, setInitData] = useState('');
+  const [startParam, setStartParam] = useState('');
   const [user, setUser] = useState<TelegramContextValue['user']>(null);
   const [isTelegram, setIsTelegram] = useState(false);
 
@@ -44,6 +46,10 @@ export function TelegramProvider({ children }: { children: ReactNode }) {
         setInitData(rawInitData);
         setIsTelegram(true);
 
+        // start_param est disponible immediatement apres tg.ready()
+        const sp = tg.initDataUnsafe?.start_param || '';
+        setStartParam(sp);
+
         if (tg.initDataUnsafe?.user) {
           setUser({
             id: tg.initDataUnsafe.user.id,
@@ -54,15 +60,12 @@ export function TelegramProvider({ children }: { children: ReactNode }) {
 
         setIsReady(true);
       } else {
-        // Not inside Telegram (browser dev mode)
         console.warn('⚠️ Not running inside Telegram. Dev mode active.');
         setIsTelegram(false);
         setIsReady(true);
       }
     };
 
-    // If SDK already loaded (script is synchronous in <head>), run immediately.
-    // Fallback: wait for DOMContentLoaded in case of async load.
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', initialize, { once: true });
     } else {
@@ -71,7 +74,7 @@ export function TelegramProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <TelegramContext.Provider value={{ initData, user, isReady, isTelegram }}>
+    <TelegramContext.Provider value={{ initData, startParam, user, isReady, isTelegram }}>
       {children}
     </TelegramContext.Provider>
   );

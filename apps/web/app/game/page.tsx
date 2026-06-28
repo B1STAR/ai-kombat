@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Settings, TrendingUp, Brain } from 'lucide-react';
 import { useGameStore } from '@/lib/store';
@@ -15,23 +15,21 @@ interface FloatingCoin { id: number; x: number; y: number; amount: number; }
 
 const fmt = (n: number) => Math.floor(n).toLocaleString('fr-FR').replace(/\u202f/g, '\u00a0');
 
-/** Badge niveau IA - remplace l'avatar Telegram (plus fiable, plus coherent) */
+/** Badge niveau IA — remplace l'avatar Telegram */
 function AiBadge({ level, type }: { level: number; type: string }) {
   const tiers = [
-    { min: 0,  max: 4,  label: 'Novice',  color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '🧠' },
-    { min: 5,  max: 9,  label: 'Initié',  color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '🐞' },
-    { min: 10, max: 19, label: 'Expert',  color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '⚡' },
-    { min: 20, max: 49, label: 'Master',  color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '🔮' },
-    { min: 50, max: 99, label: 'Legend',  color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '👑' },
-    { min: 100,max: 999,label: 'GOD',     color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '🔥' },
+    { min: 0,   max: 4,   label: 'Novice', color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '\ud83e\udde0' },
+    { min: 5,   max: 9,   label: 'Initié', color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '\ud83d\udc1e' },
+    { min: 10,  max: 19,  label: 'Expert', color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '\u26a1' },
+    { min: 20,  max: 49,  label: 'Master', color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '\ud83d\udd2e' },
+    { min: 50,  max: 99,  label: 'Legend', color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '\ud83d\udc51' },
+    { min: 100, max: 999, label: 'GOD',    color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '\ud83d\udd25' },
   ];
   const tier = tiers.find(t => level >= t.min && level <= t.max) || tiers[0];
   return (
-    <div
-      className="w-11 h-11 rounded-full flex flex-col items-center justify-center border-2 select-none"
+    <div className="w-11 h-11 rounded-full flex flex-col items-center justify-center border-2 select-none"
       style={{ background: tier.bg, borderColor: tier.color }}
-      title={`AI ${tier.label} — Level ${level}`}
-    >
+      title={`AI ${tier.label} — Level ${level}`}>
       <span style={{ fontSize: '16px', lineHeight: 1 }}>{tier.emoji}</span>
       <span style={{ fontSize: '8px', fontWeight: 700, color: tier.color, lineHeight: 1.2 }}>Lv.{level}</span>
     </div>
@@ -40,8 +38,8 @@ function AiBadge({ level, type }: { level: number; type: string }) {
 
 export default function GamePage() {
   const api = useApi();
-  const { isTelegram, initData, isReady } = useTelegram();
-  const { user, setUser, updateEnergy } = useGameStore();
+  const { isTelegram, initData, startParam, isReady } = useTelegram();
+  const { user, setUser } = useGameStore();
 
   const userRef = useRef(user);
   useEffect(() => { userRef.current = user; }, [user]);
@@ -53,14 +51,16 @@ export default function GamePage() {
   const tapBatchTimeoutRef = useRef<NodeJS.Timeout>();
   const optimisticAddedRef = useRef(0);
 
+  // ------------------------------------------------------------------
+  // Init : envoie startParam (referral) depuis le contexte Telegram
+  // ------------------------------------------------------------------
   useEffect(() => {
     if (!isReady) return;
     if (isTelegram && !initData) return;
     const init = async () => {
       try {
-        const tgStartParam = typeof window !== 'undefined'
-          ? window.Telegram?.WebApp?.initDataUnsafe?.start_param || '' : '';
-        const referralCode = tgStartParam.startsWith('ref_') ? tgStartParam : undefined;
+        // startParam est lu au moment du ready() donc toujours fiable
+        const referralCode = startParam.startsWith('ref_') ? startParam : undefined;
         const response = await api.post<{ user: any }>('/api/auth/init', { initData, referralCode });
         setUser(response.user);
       } catch (err: any) {
@@ -79,13 +79,39 @@ export default function GamePage() {
     init();
   }, [isReady, initData]);
 
-  // Recharge locale energie : 1 point toutes les 3s (synchronise avec API)
+  // ------------------------------------------------------------------
+  // Recharge énergie basée sur Date.now() — pas d'accumulation d'intervalles
+  // Toutes les secondes on calcule : énergie = min(max, base + Δt * 1/3)
+  // Si l'onglet revient d'arrière-plan, on fait UN seul calcul exact.
+  // ------------------------------------------------------------------
+  const energyTimerRef = useRef<NodeJS.Timeout>();
+  const lastTickRef = useRef<number>(Date.now());
+
   useEffect(() => {
     if (!user) return;
-    const interval = setInterval(() => { updateEnergy(1 / 3); }, 1000);
-    return () => clearInterval(interval);
-  }, [user?.max_energy]);
+    const maxEnergy = user.max_energy || 1000;
 
+    const tick = () => {
+      const now = Date.now();
+      const elapsed = (now - lastTickRef.current) / 1000; // secondes réelles — robuste au arriere-plan
+      lastTickRef.current = now;
+
+      const regen = elapsed * (1 / 3);
+
+      useGameStore.setState((state) => {
+        if (!state.user) return {};
+        const newEnergy = Math.min(maxEnergy, Number(state.user.energy) + regen);
+        return { user: { ...state.user, energy: newEnergy } };
+      });
+    };
+
+    energyTimerRef.current = setInterval(tick, 1000);
+    return () => clearInterval(energyTimerRef.current);
+  }, [user?.max_energy, user?.telegram_id]); // recrée seulement si le user change
+
+  // ------------------------------------------------------------------
+  // Tap handler
+  // ------------------------------------------------------------------
   const handleTap = (e: React.MouseEvent | React.TouchEvent) => {
     if (!user || user.energy < 1) { hapticNotification('error'); return; }
     if (isTapping) return;
@@ -94,14 +120,11 @@ export default function GamePage() {
     tapTimeoutRef.current = setTimeout(() => setIsTapping(false), 200);
 
     let clientX = 0, clientY = 0;
-    if ('touches' in e && e.touches[0]) {
-      clientX = e.touches[0].clientX; clientY = e.touches[0].clientY;
-    } else if ('clientX' in e) { clientX = e.clientX; clientY = e.clientY; }
+    if ('touches' in e && e.touches[0]) { clientX = e.touches[0].clientX; clientY = e.touches[0].clientY; }
+    else if ('clientX' in e) { clientX = e.clientX; clientY = e.clientY; }
 
     hapticImpact('light');
     const newEnergy = Math.max(0, user.energy - 2.5);
-    updateEnergy(-2.5);
-    // Mise a jour optimiste : +1 tap visible immediatement
     setUser({ ...user, coin_balance: user.coin_balance + 1, energy: newEnergy, total_taps: user.total_taps + 1 });
     optimisticAddedRef.current += 1;
 
@@ -119,12 +142,11 @@ export default function GamePage() {
       try {
         const response = await api.post<any>('/api/tap', { count: batchCount, clientTimestamp: new Date().toISOString() });
         const cu = userRef.current;
-        if (cu) setUser({
-          ...cu,
-          coin_balance: response.newBalance,
-          energy: response.newEnergy,
-          total_taps: response.newTotalTaps ?? cu.total_taps, // sync reel depuis API
-        });
+        if (cu) {
+          setUser({ ...cu, coin_balance: response.newBalance, energy: response.newEnergy, total_taps: response.newTotalTaps ?? cu.total_taps });
+          // Resync le timer apres sync API pour eviter la derive
+          lastTickRef.current = Date.now();
+        }
         if (response.aiLevelUp) hapticNotification('success');
       } catch {
         const cu = userRef.current;
@@ -157,14 +179,12 @@ export default function GamePage() {
       {/* TOP BAR */}
       <div className="flex items-center justify-between px-4 pt-4 pb-3">
         <div className="flex items-center gap-3">
-          {/* Badge IA a la place de l'avatar Telegram */}
           <AiBadge level={user.ai_level} type={user.ai_type} />
           <div>
             <p className="text-sm font-bold text-white leading-tight">{user.first_name} {user.last_name || ''}</p>
             <p className="text-xs text-slate-400 leading-tight capitalize">{user.ai_type} &bull; Level {user.ai_level}</p>
           </div>
         </div>
-
         <div className="flex items-center gap-2 rounded-2xl px-3 py-2"
           style={{ background: '#12141f', border: '1px solid #2a2d40' }}>
           <div className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: 'rgba(234,179,8,0.12)' }}>
@@ -175,7 +195,6 @@ export default function GamePage() {
             <p className="text-sm font-bold text-yellow-300 leading-tight">+{fmt(user.passiveIncomePerHour)}</p>
           </div>
         </div>
-
         <button className="w-10 h-10 rounded-full flex items-center justify-center"
           style={{ background: '#12141f', border: '1px solid #2a2d40' }}>
           <Settings className="w-5 h-5 text-slate-400" />
@@ -221,7 +240,7 @@ export default function GamePage() {
         <div className="w-full h-2.5 rounded-full overflow-hidden mb-3"
           style={{ background: '#12141f', border: '1px solid #1e2030' }}>
           <motion.div className={`h-full bg-gradient-to-r ${energyColor} rounded-full`}
-            animate={{ width: `${energyPercent}%` }} transition={{ duration: 0.2 }} />
+            animate={{ width: `${energyPercent}%` }} transition={{ duration: 0.3 }} />
         </div>
         <div className="flex gap-2">
           {[
