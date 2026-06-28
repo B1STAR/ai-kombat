@@ -1,8 +1,7 @@
 /**
- * Tap routes: /api/tap/*
- * POST /api/tap — retourne desormais aussi total_taps pour que le frontend
- * puisse l'afficher en temps reel sans rechargement.
- * Regen energie : 1/3 par seconde (calcule dans user.service.ts).
+ * Tap routes: /api/tap
+ * POST /api/tap
+ * Fix: energy stockee en INTEGER dans Postgres -> Math.floor() obligatoire avant update.
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -40,7 +39,7 @@ tap.post(
     if (currentEnergy < 1) {
       return c.json({
         error: 'Insufficient energy',
-        energy: currentEnergy,
+        energy: Math.floor(currentEnergy),
         maxEnergy: dbUser.max_energy,
       }, 400);
     }
@@ -58,7 +57,8 @@ tap.post(
     await logTapEvent(user.id, { count, clientTimestamp, durationMs }, ip, userAgent, suspicious);
 
     const finalCoins = suspicious ? 0 : coinsEarned;
-    const newEnergy = Math.max(0, currentEnergy - energyToSpend);
+    // CRITICAL: Postgres energy est INTEGER — on floor() avant d'ecrire
+    const newEnergy = Math.max(0, Math.floor(currentEnergy - energyToSpend));
 
     await db('users')
       .where({ telegram_id: user.id })
@@ -72,14 +72,13 @@ tap.post(
     const updated = await getUserByTelegramId(user.id);
     if (!updated) return c.json({ error: 'User disappeared' }, 500);
 
-    // On inclut total_taps dans la reponse pour rafraichissement temps reel
     return c.json({
       coinsEarned: finalCoins,
       xpGained,
       energySpent: energyToSpend,
-      newEnergy: updated.energy,
+      newEnergy: Math.floor(Number(updated.energy)),
       newBalance: updated.coin_balance,
-      newTotalTaps: updated.total_taps, // <-- nouveau champ
+      newTotalTaps: updated.total_taps,
       aiLevelUp: leveledUp,
       newAiLevel: newLevel,
       suspicious,
