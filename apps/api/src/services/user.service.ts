@@ -35,6 +35,23 @@ export interface User {
   ban_reason: string | null;
 }
 
+/**
+ * PostgreSQL retourne les colonnes BIGINT comme string en JS via Knex.
+ * Cette fonction normalise tous les champs numeriques critiques d'un user.
+ */
+export const normalizeUser = (user: any): User => ({
+  ...user,
+  coin_balance: Number(user.coin_balance),
+  gem_balance: Number(user.gem_balance),
+  energy: Number(user.energy),
+  max_energy: Number(user.max_energy),
+  total_earned_coins: Number(user.total_earned_coins),
+  ai_level: Number(user.ai_level),
+  ai_xp: Number(user.ai_xp),
+  referral_count: Number(user.referral_count),
+  total_taps: Number(user.total_taps),
+});
+
 export const upsertUser = async (parsed: InitDataParsed): Promise<User> => {
   if (!parsed.user) throw new Error('No user in initData');
   
@@ -53,20 +70,20 @@ export const upsertUser = async (parsed: InitDataParsed): Promise<User> => {
     .merge(['first_name', 'last_name', 'username', 'photo_url', 'is_premium', 'language_code', 'last_active_at'])
     .returning('*');
   
-  return user;
+  return normalizeUser(user);
 };
 
 export const getUserByTelegramId = async (telegramId: number): Promise<User | null> => {
   const user = await db<User>('users').where({ telegram_id: telegramId }).first();
-  return user || null;
+  return user ? normalizeUser(user) : null;
 };
 
 export const calculateValidEnergy = (user: User, now: Date = new Date()): number => {
   const lastUpdate = new Date(user.last_energy_update);
   const secondsPassed = Math.floor((now.getTime() - lastUpdate.getTime()) / 1000);
-  const regenPerSecond = 1; // 1 energy / sec (configurable)
-  const newEnergy = user.energy + (secondsPassed * regenPerSecond);
-  return Math.min(newEnergy, user.max_energy);
+  const regenPerSecond = 1;
+  const newEnergy = Number(user.energy) + (secondsPassed * regenPerSecond);
+  return Math.min(newEnergy, Number(user.max_energy));
 };
 
 export const addCoins = async (userId: number, amount: number, type: string, relatedEntity?: { type: string; id: number }): Promise<number> => {
@@ -76,22 +93,25 @@ export const addCoins = async (userId: number, amount: number, type: string, rel
     .increment('total_earned_coins', amount > 0 ? amount : 0)
     .returning('coin_balance');
   
+  const newBalance = Number(updated.coin_balance);
+
   await db('transactions').insert({
     user_id: userId,
     type,
     currency: 'coin',
     amount,
-    balance_after: updated.coin_balance,
+    balance_after: newBalance,
     related_entity_type: relatedEntity?.type || null,
     related_entity_id: relatedEntity?.id || null,
   });
   
-  return updated.coin_balance;
+  return newBalance;
 };
 
 export const spendCoins = async (userId: number, amount: number, type: string, relatedEntity?: { type: string; id: number }): Promise<number> => {
   const user = await getUserByTelegramId(userId);
   if (!user) throw new Error('User not found');
+  // normalizeUser garantit que coin_balance est un Number
   if (user.coin_balance < amount) throw new Error('Insufficient coins');
   
   const [updated] = await db<User>('users')
@@ -99,33 +119,32 @@ export const spendCoins = async (userId: number, amount: number, type: string, r
     .decrement('coin_balance', amount)
     .returning('coin_balance');
   
+  const newBalance = Number(updated.coin_balance);
+
   await db('transactions').insert({
     user_id: userId,
     type,
     currency: 'coin',
     amount: -amount,
-    balance_after: updated.coin_balance,
+    balance_after: newBalance,
     related_entity_type: relatedEntity?.type || null,
     related_entity_id: relatedEntity?.id || null,
   });
   
-  return updated.coin_balance;
+  return newBalance;
 };
 
 export const getUserProgress = async (userId: number) => {
-  // Get active quests
   const activeQuests = await db('user_quests')
     .where({ user_id: userId, is_completed: false })
     .join('quests', 'quests.id', 'user_quests.quest_id')
     .select('user_quests.*', 'quests.name', 'quests.description', 'quests.reward_coins', 'quests.target_count');
   
-  // Get owned modules
   const ownedModules = await db('user_modules')
     .where({ user_id: userId })
     .join('ai_modules', 'ai_modules.id', 'user_modules.module_id')
     .select('user_modules.*', 'ai_modules.code', 'ai_modules.name', 'ai_modules.coins_per_hour_bonus');
   
-  // Get achievements
   const achievements = await db('user_achievements')
     .where({ user_id: userId })
     .join('achievements', 'achievements.id', 'user_achievements.achievement_id')
