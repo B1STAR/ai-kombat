@@ -22,7 +22,7 @@ import leaderboard from './routes/leaderboard';
 import ads from './routes/ads';
 import cashout from './routes/cashout';
 import token from './routes/token';
-import v1 from './routes/v1';
+import v1 from './routes/v1/index';
 
 const app = new Hono();
 
