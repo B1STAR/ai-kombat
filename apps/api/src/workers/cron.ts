@@ -1,16 +1,23 @@
 /**
  * Cron jobs (background workers).
- * Passive income : credite aussi 10% au parrain de chaque filleul actif.
+ *
+ * energyRegen : ne recharge PAS les users dont energy_exhausted_at est set
+ * depuis moins de 30s. Apres le cooldown, recharge normalement et clear le flag.
+ *
+ * passiveIncome : credite 10% au parrain de chaque filleul actif.
  */
 import { db } from '../db/knex';
 import { logger } from '../lib/logger';
+
+const REGEN_COOLDOWN_SECONDS = 30;
 
 // ============================================
 // ENERGY REGEN: every 10 seconds
 // ============================================
 const energyRegen = async () => {
   try {
-    const result = await db.raw(`
+    // Cas 1 : users normaux (jamais epuises OU flag deja clear)
+    await db.raw(`
       UPDATE users
       SET
         energy = LEAST(
@@ -20,11 +27,29 @@ const energyRegen = async () => {
         last_energy_update = NOW()
       WHERE
         energy < max_energy
+        AND energy_exhausted_at IS NULL
         AND last_active_at > NOW() - INTERVAL '7 days'
     `);
-    if (result.rowCount > 0) {
-      logger.debug({ count: result.rowCount }, 'Energy regen');
-    }
+
+    // Cas 2 : users en cooldown post-epuisement (>= 30s ecoulees)
+    // On recharge depuis le moment ou le cooldown s'est termine
+    await db.raw(`
+      UPDATE users
+      SET
+        energy = LEAST(
+          GREATEST(
+            (EXTRACT(EPOCH FROM (NOW() - (energy_exhausted_at + INTERVAL '${REGEN_COOLDOWN_SECONDS} seconds'))) * (1.0/3.0))::INTEGER,
+            0
+          ),
+          max_energy
+        ),
+        last_energy_update = NOW(),
+        energy_exhausted_at = NULL
+      WHERE
+        energy_exhausted_at IS NOT NULL
+        AND energy_exhausted_at < NOW() - INTERVAL '${REGEN_COOLDOWN_SECONDS} seconds'
+        AND last_active_at > NOW() - INTERVAL '7 days'
+    `);
   } catch (err) {
     logger.error({ err }, 'Energy regen failed');
   }
@@ -32,7 +57,6 @@ const energyRegen = async () => {
 
 // ============================================
 // PASSIVE INCOME: every minute
-// Credite le filleul puis 10% au parrain.
 // ============================================
 const passiveIncome = async () => {
   try {
@@ -53,13 +77,11 @@ const passiveIncome = async () => {
       const perMinute = Math.floor(hourly / 60);
       if (perMinute <= 0) continue;
 
-      // Crediter le filleul
       await db('users')
         .where({ telegram_id: user.telegram_id })
         .increment('coin_balance', perMinute)
         .increment('total_earned_coins', perMinute);
 
-      // Commission 10% au parrain si existe
       const referrerId = user.referred_by ? Number(user.referred_by) : null;
       if (referrerId) {
         const commission = Math.floor(perMinute * 0.1);
@@ -69,7 +91,6 @@ const passiveIncome = async () => {
               .where({ telegram_id: referrerId })
               .increment('coin_balance', commission)
               .increment('total_earned_coins', commission);
-
             const referrer = await db('users').where({ telegram_id: referrerId }).first('coin_balance');
             await db('transactions').insert({
               user_id: referrerId,
@@ -100,18 +121,15 @@ const dailyReset = async () => {
       .where('is_completed', true)
       .where('completed_at', '<', db.raw('CURRENT_DATE'))
       .delete();
-
     await db.raw(`
       UPDATE users SET daily_streak = daily_streak + 1
       WHERE last_active_at > NOW() - INTERVAL '36 hours'
         AND last_active_at < NOW() - INTERVAL '24 hours'
     `);
-
     await db.raw(`
       UPDATE users SET daily_streak = 0
       WHERE last_active_at < NOW() - INTERVAL '48 hours'
     `);
-
     logger.info('Daily reset completed');
   } catch (err) {
     logger.error({ err }, 'Daily reset failed');
@@ -125,9 +143,7 @@ export const startCrons = () => {
   setInterval(energyRegen, 10_000);
   setInterval(passiveIncome, 60_000);
   setInterval(dailyReset, 24 * 60 * 60 * 1000);
-
   energyRegen();
   passiveIncome();
-
   logger.info('\u2705 Cron jobs started');
 };

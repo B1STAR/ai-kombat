@@ -1,7 +1,13 @@
 /**
  * Tap routes: /api/tap
- * POST /api/tap
- * Apres chaque tap gagnant, on credite 10% au parrain (si existe).
+ *
+ * FIX RACE CONDITION : on utilise un UPDATE atomique avec WHERE energy >= energyToSpend
+ * pour eviter que 2 requetes paralleles lisent le meme solde et creent une energie negative.
+ * Si l'UPDATE ne touche aucune ligne (energie insuffisante entre temps), on renvoie 400.
+ *
+ * FIX EPUISEMENT : quand energy tombe a 0, on set energy_exhausted_at = NOW().
+ * La regen ne reprend qu'apres 30s (geree dans calculateValidEnergy).
+ * Quand l'energie remonte au-dessus de 0, on clear energy_exhausted_at.
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -23,24 +29,18 @@ const tapSchema = z.object({
 });
 
 /** Credite 10% des gains au parrain du filleul, sans bloquer le tap. */
-async function creditReferrerCommission(
-  filleulId: number,
-  coinsEarned: number,
-): Promise<void> {
+async function creditReferrerCommission(filleulId: number, coinsEarned: number): Promise<void> {
   if (coinsEarned <= 0) return;
   const commission = Math.floor(coinsEarned * 0.1);
   if (commission <= 0) return;
-
   try {
     const filleul = await db('users').where({ telegram_id: filleulId }).first('referred_by');
     const referrerId = filleul?.referred_by ? Number(filleul.referred_by) : null;
     if (!referrerId) return;
-
     await db('users')
       .where({ telegram_id: referrerId })
       .increment('coin_balance', commission)
       .increment('total_earned_coins', commission);
-
     const referrer = await db('users').where({ telegram_id: referrerId }).first('coin_balance');
     await db('transactions').insert({
       user_id: referrerId,
@@ -52,7 +52,6 @@ async function creditReferrerCommission(
       related_entity_id: filleulId,
     });
   } catch (err) {
-    // Ne jamais bloquer le tap pour une commission
     logger.debug({ err, filleulId }, 'referrer commission tap failed silently');
   }
 }
@@ -74,34 +73,58 @@ tap.post(
     if (currentEnergy < 1) {
       return c.json({
         error: 'Insufficient energy',
-        energy: Math.floor(currentEnergy),
+        energy: 0,
         maxEnergy: dbUser.max_energy,
       }, 400);
     }
 
-    const energyToSpend = Math.min(count, Math.floor(currentEnergy));
+    const energyToSpend = Math.min(count, currentEnergy);
     const passiveIncome = await getPassiveIncomePerHour(user.id);
     const multiplier = 1 + Math.floor(passiveIncome / 1000) * 0.1;
     const coinsEarned = Math.floor(energyToSpend * multiplier);
     const xpGained = energyToSpend;
 
     const { suspicious } = await detectSuspiciousPattern(user.id, { count, clientTimestamp, durationMs });
-
     const ip = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
     const userAgent = c.req.header('user-agent') || 'unknown';
     await logTapEvent(user.id, { count, clientTimestamp, durationMs }, ip, userAgent, suspicious);
 
     const finalCoins = suspicious ? 0 : coinsEarned;
-    const newEnergy = Math.max(0, Math.floor(currentEnergy - energyToSpend));
+    const newEnergy = Math.max(0, currentEnergy - energyToSpend);
+    const isExhausted = newEnergy === 0;
 
-    await db('users')
+    // UPDATE ATOMIQUE : garantit qu'on ne descend jamais sous 0
+    // meme si 2 requetes arrivent en meme temps.
+    const updatePayload: Record<string, any> = {
+      energy: newEnergy,
+      last_energy_update: new Date(),
+    };
+    if (isExhausted) {
+      // Marquer l'epuisement pour declencher le cooldown de regen
+      updatePayload.energy_exhausted_at = new Date();
+    } else if (dbUser.energy_exhausted_at) {
+      // L'energie est remontee : on efface le flag d'epuisement
+      updatePayload.energy_exhausted_at = null;
+    }
+
+    const updatedRows = await db('users')
       .where({ telegram_id: user.id })
-      .update({ energy: newEnergy, last_energy_update: new Date() })
-      .increment('total_taps', energyToSpend);
+      .whereRaw('energy >= ?', [energyToSpend])
+      .update(updatePayload)
+      .returning('energy');
+
+    // Si aucune ligne mise a jour : race condition, un autre tap a consomme l'energie
+    if (!updatedRows || updatedRows.length === 0) {
+      const fresh = await getUserByTelegramId(user.id);
+      return c.json({
+        error: 'Insufficient energy',
+        energy: fresh ? Math.floor(Number(fresh.energy)) : 0,
+        maxEnergy: dbUser.max_energy,
+      }, 400);
+    }
 
     if (finalCoins > 0) {
       await addCoins(user.id, finalCoins, 'tap_earn');
-      // Commission 10% au parrain (async, ne bloque pas la reponse)
       creditReferrerCommission(user.id, finalCoins).catch(() => {});
     }
 
@@ -114,6 +137,7 @@ tap.post(
       xpGained,
       energySpent: energyToSpend,
       newEnergy: Math.floor(Number(updated.energy)),
+      maxEnergy: updated.max_energy,
       newBalance: updated.coin_balance,
       newTotalTaps: updated.total_taps,
       aiLevelUp: leveledUp,

@@ -18,6 +18,7 @@ export interface User {
   energy: number;
   max_energy: number;
   last_energy_update: string;
+  energy_exhausted_at: string | null;
   ai_name: string;
   ai_level: number;
   ai_xp: number;
@@ -73,15 +74,30 @@ export const getUserByTelegramId = async (telegramId: number): Promise<User | nu
 };
 
 /**
- * Calcule l'energie regeneree depuis la derniere mise a jour.
- * Regen : 1 point toutes les 3 secondes (0.333/s) — 3x plus lent qu'avant.
+ * Calcule l'energie actuelle en tenant compte de la regen progressive.
+ * - Si energy_exhausted_at est set, la regen ne commence QU'APRES 30s d'attente.
+ * - Regen : 1 point / 3 secondes (0.333/s).
+ * Retourne un entier (floor) pour eviter les floats en DB.
  */
 export const calculateValidEnergy = (user: User, now: Date = new Date()): number => {
-  const lastUpdate = new Date(user.last_energy_update);
-  const secondsPassed = Math.floor((now.getTime() - lastUpdate.getTime()) / 1000);
-  const regenPerSecond = 1 / 3; // 3x plus lent
-  const newEnergy = Number(user.energy) + (secondsPassed * regenPerSecond);
-  return Math.min(newEnergy, Number(user.max_energy));
+  const REGEN_DELAY_AFTER_EXHAUSTION_MS = 30_000; // 30s avant de recharger apres epuisement
+  const REGEN_PER_SECOND = 1 / 3;
+
+  let regenStartTime: Date;
+
+  if (user.energy_exhausted_at) {
+    // Energie epuisee : on attend 30s avant de commencer a recharger
+    const exhaustedAt = new Date(user.energy_exhausted_at);
+    regenStartTime = new Date(exhaustedAt.getTime() + REGEN_DELAY_AFTER_EXHAUSTION_MS);
+    if (now < regenStartTime) return 0; // Toujours en cooldown
+  } else {
+    regenStartTime = new Date(user.last_energy_update);
+  }
+
+  const secondsPassed = Math.max(0, (now.getTime() - regenStartTime.getTime()) / 1000);
+  const baseEnergy = user.energy_exhausted_at ? 0 : Number(user.energy);
+  const newEnergy = baseEnergy + (secondsPassed * REGEN_PER_SECOND);
+  return Math.min(Math.floor(newEnergy), Number(user.max_energy));
 };
 
 export const addCoins = async (userId: number, amount: number, type: string, relatedEntity?: { type: string; id: number }): Promise<number> => {
