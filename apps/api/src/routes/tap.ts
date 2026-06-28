@@ -1,7 +1,7 @@
 /**
  * Tap routes: /api/tap
  * POST /api/tap
- * Fix: energy stockee en INTEGER dans Postgres -> Math.floor() obligatoire avant update.
+ * Apres chaque tap gagnant, on credite 10% au parrain (si existe).
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -21,6 +21,41 @@ const tapSchema = z.object({
   clientTimestamp: z.string(),
   durationMs: z.number().optional(),
 });
+
+/** Credite 10% des gains au parrain du filleul, sans bloquer le tap. */
+async function creditReferrerCommission(
+  filleulId: number,
+  coinsEarned: number,
+): Promise<void> {
+  if (coinsEarned <= 0) return;
+  const commission = Math.floor(coinsEarned * 0.1);
+  if (commission <= 0) return;
+
+  try {
+    const filleul = await db('users').where({ telegram_id: filleulId }).first('referred_by');
+    const referrerId = filleul?.referred_by ? Number(filleul.referred_by) : null;
+    if (!referrerId) return;
+
+    await db('users')
+      .where({ telegram_id: referrerId })
+      .increment('coin_balance', commission)
+      .increment('total_earned_coins', commission);
+
+    const referrer = await db('users').where({ telegram_id: referrerId }).first('coin_balance');
+    await db('transactions').insert({
+      user_id: referrerId,
+      type: 'referral_commission',
+      currency: 'coin',
+      amount: commission,
+      balance_after: Number(referrer?.coin_balance ?? commission),
+      related_entity_type: 'referral',
+      related_entity_id: filleulId,
+    });
+  } catch (err) {
+    // Ne jamais bloquer le tap pour une commission
+    logger.debug({ err, filleulId }, 'referrer commission tap failed silently');
+  }
+}
 
 tap.post(
   '/',
@@ -50,14 +85,13 @@ tap.post(
     const coinsEarned = Math.floor(energyToSpend * multiplier);
     const xpGained = energyToSpend;
 
-    const { suspicious, reason } = await detectSuspiciousPattern(user.id, { count, clientTimestamp, durationMs });
+    const { suspicious } = await detectSuspiciousPattern(user.id, { count, clientTimestamp, durationMs });
 
     const ip = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
     const userAgent = c.req.header('user-agent') || 'unknown';
     await logTapEvent(user.id, { count, clientTimestamp, durationMs }, ip, userAgent, suspicious);
 
     const finalCoins = suspicious ? 0 : coinsEarned;
-    // CRITICAL: Postgres energy est INTEGER — on floor() avant d'ecrire
     const newEnergy = Math.max(0, Math.floor(currentEnergy - energyToSpend));
 
     await db('users')
@@ -65,10 +99,13 @@ tap.post(
       .update({ energy: newEnergy, last_energy_update: new Date() })
       .increment('total_taps', energyToSpend);
 
-    if (finalCoins > 0) await addCoins(user.id, finalCoins, 'tap_earn');
+    if (finalCoins > 0) {
+      await addCoins(user.id, finalCoins, 'tap_earn');
+      // Commission 10% au parrain (async, ne bloque pas la reponse)
+      creditReferrerCommission(user.id, finalCoins).catch(() => {});
+    }
 
     const { leveledUp, newLevel } = await addXp(user.id, xpGained);
-
     const updated = await getUserByTelegramId(user.id);
     if (!updated) return c.json({ error: 'User disappeared' }, 500);
 

@@ -1,10 +1,6 @@
 /**
  * Auth routes: /api/auth/init
- *
- * STRATEGIE REFERRAL BULLETPROOF (double source) :
- * Source 1 — start_param dans initData parse (signe par Telegram).
- * Source 2 — pending_referrals enregistre par le bot au /start ref_XXX.
- * On prefere Source 1, sinon Source 2. Consomme a la premiere inscription.
+ * Referral bulletproof double source + bonus 500 coins parrain a l'inscription.
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -43,6 +39,7 @@ async function processReferral(
       return;
     }
 
+    // Lier le filleul a son parrain
     await trx('users')
       .where({ telegram_id: newUserTelegramId })
       .update({ referred_by: referrerId });
@@ -54,31 +51,46 @@ async function processReferral(
     await trx('referrals').insert({
       referrer_id: referrerId,
       referred_id: newUserTelegramId,
-      bonus_paid: false,
+      bonus_paid: true, // on marque paid car on credite immediatement
     });
 
-    // Bonus bienvenue : +500 coins au filleul
+    // --- BONUS FILLEUL : +500 coins ---
     await trx('users')
       .where({ telegram_id: newUserTelegramId })
       .increment('coin_balance', 500);
 
-    // Lire le solde mis a jour pour le stocker dans balance_after (NOT NULL)
-    const updatedUser = await trx('users')
-      .where({ telegram_id: newUserTelegramId })
-      .first('coin_balance');
-    const balanceAfter = Number(updatedUser?.coin_balance ?? 500);
+    const filleulUpdated = await trx('users').where({ telegram_id: newUserTelegramId }).first('coin_balance');
+    const filleulBalance = Number(filleulUpdated?.coin_balance ?? 500);
 
     await trx('transactions').insert({
       user_id: newUserTelegramId,
       type: 'referral_welcome',
       currency: 'coin',
       amount: 500,
-      balance_after: balanceAfter,
+      balance_after: filleulBalance,
       related_entity_type: 'referral',
       related_entity_id: referrerId,
     });
 
-    logger.info({ newUserTelegramId, referrerId, balanceAfter, source }, 'Referral attribue avec succes');
+    // --- BONUS PARRAIN : +500 coins a l'inscription ---
+    await trx('users')
+      .where({ telegram_id: referrerId })
+      .increment('coin_balance', 500);
+
+    const parrainUpdated = await trx('users').where({ telegram_id: referrerId }).first('coin_balance');
+    const parrainBalance = Number(parrainUpdated?.coin_balance ?? 500);
+
+    await trx('transactions').insert({
+      user_id: referrerId,
+      type: 'referral_bonus',
+      currency: 'coin',
+      amount: 500,
+      balance_after: parrainBalance,
+      related_entity_type: 'referral',
+      related_entity_id: newUserTelegramId,
+    });
+
+    logger.info({ newUserTelegramId, referrerId, source }, 'Referral attribue : +500 filleul +500 parrain');
   });
 }
 
@@ -101,27 +113,17 @@ auth.post('/init', zValidator('json', initSchema), async (c) => {
 
   const newUserId = parsed.user.id;
 
-  // Source 1 : start_param depuis initData parse
-  const startParamRaw =
-    (parsed as any).startParam ??
-    (parsed as any).start_param ??
-    null;
-
-  // Fallback : lecture depuis la chaine brute URLSearchParams
+  const startParamRaw = (parsed as any).startParam ?? (parsed as any).start_param ?? null;
   let startParamFromRaw: string | null = null;
-  try {
-    startParamFromRaw = new URLSearchParams(initData).get('start_param');
-  } catch (_) {}
-
+  try { startParamFromRaw = new URLSearchParams(initData).get('start_param'); } catch (_) {}
   const startParam = startParamRaw ?? startParamFromRaw ?? frontendCode ?? null;
+
   logger.info({ newUserId, startParam }, 'auth/init');
 
   const user = await upsertUser(parsed);
 
   if (!user.referred_by) {
     const referrerFromParam = extractReferrerId(startParam);
-
-    // Source 2 : pending_referral enregistre par le bot
     const pending = await db('pending_referrals')
       .where({ telegram_id: newUserId })
       .where('expires_at', '>', new Date())
@@ -150,10 +152,7 @@ auth.post('/init', zValidator('json', initSchema), async (c) => {
   const freshUser = await getUserByTelegramId(newUserId);
 
   return c.json({
-    user: {
-      ...(freshUser ?? user),
-      passiveIncomePerHour: passiveIncome,
-    },
+    user: { ...(freshUser ?? user), passiveIncomePerHour: passiveIncome },
     ...progress,
   });
 });
