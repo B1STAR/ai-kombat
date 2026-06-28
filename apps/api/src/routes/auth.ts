@@ -1,11 +1,19 @@
 /**
- * Auth routes: /api/auth/*
- * POST /api/auth/init
+ * Auth routes: /api/auth/init
  *
- * Strategie referral robuste :
- * 1. On extrait start_param depuis initData PARSE cote serveur (signe par Telegram, inalterable).
- * 2. Si absent dans initData (cas rare), on utilise referralCode envoye par le frontend.
- * Ainsi meme si le frontend loupe le start_param, le serveur le recupere directement.
+ * STRATEGIE REFERRAL BULLETPROOF (double source) :
+ *
+ * Source 1 — start_param dans initData parse (signe par Telegram).
+ *   Disponible uniquement si le bot a une "Main Mini App" configuree dans
+ *   BotFather. Fiable quand present, mais pas toujours present.
+ *
+ * Source 2 — pending_referrals (charge utile du bot) [source principale].
+ *   Des que l'utilisateur clique sur t.me/bot?start=ref_XXX, le bot
+ *   enregistre une ligne AVANT que la mini app s'ouvre. Cette source est
+ *   independante de la configuration BotFather et toujours presente.
+ *
+ * On prefere Source 1 si presente, sinon Source 2. Les deux sont consommees
+ * a la premiere inscription uniquement.
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -21,18 +29,63 @@ const auth = new Hono();
 
 const initSchema = z.object({
   initData: z.string(),
-  referralCode: z.string().optional(), // fallback envoye par le frontend
+  referralCode: z.string().optional(), // fallback frontend (3e niveau de securite)
 });
 
-/** Extrait ref_XXXXXX depuis une chaine, retourne le telegram_id numerique ou null */
-function extractReferrerId(code: string | undefined): number | null {
+function extractReferrerId(code: string | undefined | null): number | null {
   if (!code) return null;
   const match = code.match(/^ref_(\d+)$/);
   return match ? parseInt(match[1], 10) : null;
 }
 
+async function processReferral(
+  newUserTelegramId: number,
+  referrerId: number,
+  source: string,
+): Promise<void> {
+  if (referrerId === newUserTelegramId) return;
+
+  await db.transaction(async (trx) => {
+    const referrer = await trx('users').where({ telegram_id: referrerId }).first();
+    if (!referrer) {
+      logger.warn({ referrerId, source }, 'Parrain introuvable, referral ignore');
+      return;
+    }
+
+    await trx('users')
+      .where({ telegram_id: newUserTelegramId })
+      .update({ referred_by: referrerId });
+
+    await trx('users')
+      .where({ telegram_id: referrerId })
+      .increment('referral_count', 1);
+
+    await trx('referrals').insert({
+      referrer_id: referrerId,
+      referred_id: newUserTelegramId,
+      bonus_paid: false,
+    });
+
+    // Bonus bienvenue filleul
+    await trx('users')
+      .where({ telegram_id: newUserTelegramId })
+      .increment('coin_balance', 500);
+
+    await trx('transactions').insert({
+      user_id: newUserTelegramId,
+      type: 'referral_welcome',
+      currency: 'coin',
+      amount: 500,
+      related_entity_type: 'referral',
+      related_entity_id: referrerId,
+    });
+
+    logger.info({ newUserTelegramId, referrerId, source }, 'Referral attribue avec succes');
+  });
+}
+
 auth.post('/init', zValidator('json', initSchema), async (c) => {
-  const { initData, referralCode: frontendReferralCode } = c.req.valid('json');
+  const { initData, referralCode: frontendCode } = c.req.valid('json');
 
   // 1. Valider signature HMAC
   try {
@@ -41,85 +94,79 @@ auth.post('/init', zValidator('json', initSchema), async (c) => {
     return c.json({ error: err?.message ?? 'Invalid initData' }, 401);
   }
 
-  // 2. Parser initData — start_param est ici, signe par Telegram
+  // 2. Parser initData
   let parsed: ReturnType<typeof parse>;
   try {
     parsed = parse(initData);
   } catch (err: any) {
     return c.json({ error: 'Failed to parse initData' }, 400);
   }
+  if (!parsed.user) return c.json({ error: 'No user in initData' }, 400);
 
-  if (!parsed.user) {
-    return c.json({ error: 'No user in initData' }, 400);
-  }
+  const newUserId = parsed.user.id;
 
-  // 3. Recuperer start_param depuis initData parse (source de verite)
-  //    Fallback : referralCode envoye par le frontend
-  const startParam = (parsed as any).startParam
-    ?? (parsed as any).start_param
-    ?? frontendReferralCode
-    ?? '';
+  // 3. Extraire start_param depuis initData parse (Source 1)
+  const startParamRaw =
+    (parsed as any).startParam ??
+    (parsed as any).start_param ??
+    null;
 
-  logger.info({ startParam, userId: parsed.user.id }, 'auth/init start_param');
+  // Aussi tenter de le lire depuis la chaine brute (URLSearchParams) —
+  // certains clients le mettent la sans passer par le champ parse
+  let startParamFromRaw: string | null = null;
+  try {
+    const p = new URLSearchParams(initData);
+    startParamFromRaw = p.get('start_param');
+  } catch (_) {}
+
+  const startParam = startParamRaw ?? startParamFromRaw ?? frontendCode ?? null;
+
+  logger.info({ newUserId, startParam, frontendCode }, 'auth/init');
 
   // 4. Upsert user
   const user = await upsertUser(parsed);
 
-  // 5. Traitement referral (premiere inscription uniquement)
-  if (startParam && !user.referred_by) {
-    const referrerId = extractReferrerId(startParam);
-    if (referrerId && referrerId !== user.telegram_id) {
+  // 5. Referral — premiere inscription uniquement
+  if (!user.referred_by) {
+    // Source 1 : start_param signe
+    const referrerFromParam = extractReferrerId(startParam);
+
+    // Source 2 : pending_referral enregistre par le bot
+    const pending = await db('pending_referrals')
+      .where({ telegram_id: newUserId })
+      .where('expires_at', '>', new Date())
+      .first();
+
+    const referrerId = referrerFromParam ?? (pending ? Number(pending.referrer_id) : null);
+
+    if (referrerId) {
+      const source = referrerFromParam ? 'start_param' : 'pending_referral';
       try {
-        await db.transaction(async (trx) => {
-          const referrer = await trx('users').where({ telegram_id: referrerId }).first();
-          if (!referrer) {
-            logger.warn({ referrerId }, 'Referrer not found in DB');
-            return;
-          }
-
-          await trx('users')
-            .where({ telegram_id: user.telegram_id })
-            .update({ referred_by: referrerId });
-
-          await trx('users')
-            .where({ telegram_id: referrerId })
-            .increment('referral_count', 1);
-
-          await trx('referrals').insert({
-            referrer_id: referrerId,
-            referred_id: user.telegram_id,
-            bonus_paid: false,
-          });
-
-          // Bonus bienvenue pour le filleul
-          await trx('users')
-            .where({ telegram_id: user.telegram_id })
-            .increment('coin_balance', 500);
-
-          await trx('transactions').insert({
-            user_id: user.telegram_id,
-            type: 'referral_welcome',
-            currency: 'coin',
-            amount: 500,
-            related_entity_type: 'referral',
-            related_entity_id: referrerId,
-          });
-
-          logger.info({ referrerId, newUser: user.telegram_id }, 'Referral processed OK');
-        });
+        await processReferral(newUserId, referrerId, source);
       } catch (err) {
-        logger.error({ err }, 'Referral transaction failed');
+        logger.error({ err }, 'processReferral failed');
       }
+    } else {
+      logger.info({ newUserId }, 'Aucun referral detecte');
+    }
+
+    // Nettoyer le pending dans tous les cas (evite double attribution)
+    if (pending) {
+      await db('pending_referrals').where({ telegram_id: newUserId }).delete();
     }
   }
 
-  // 6. Retourner l'etat complet
+  // 6. Retour
   const progress = await getUserProgress(user.telegram_id);
   const passiveIncome = await getPassiveIncomePerHour(user.telegram_id);
 
+  // Recharger l'user pour avoir coin_balance a jour apres bonus eventuel
+  const { getUserByTelegramId } = await import('../services/user.service');
+  const freshUser = await getUserByTelegramId(newUserId);
+
   return c.json({
     user: {
-      ...user,
+      ...(freshUser ?? user),
       passiveIncomePerHour: passiveIncome,
     },
     ...progress,
