@@ -27,7 +27,7 @@ import v1 from './routes/v1/index';
 const app = new Hono();
 
 app.use('*', cors({
-  origin: env.ALLOWED_ORIGINS?.split(',') ?? ['*'],
+  origin: env.FRONTEND_URL,
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
@@ -53,17 +53,17 @@ app.route('/api/v1', v1);
 if (env.NODE_ENV === 'production') {
   try {
     startCrons();
-    logger.info('✅ Cron jobs started');
+    logger.info('✅  Cron jobs started');
   } catch (err) {
-    logger.fatal({ err }, '❌ startCrons failed — exiting');
+    logger.fatal({ err }, '❌  startCrons failed — exiting');
     process.exit(1);
   }
 
   try {
     startBot();
-    logger.info('✅ Telegram bot started');
+    logger.info('✅  Telegram bot started');
   } catch (err) {
-    logger.fatal({ err }, '❌ startBot failed — exiting');
+    logger.fatal({ err }, '❌  startBot failed — exiting');
     process.exit(1);
   }
 }
