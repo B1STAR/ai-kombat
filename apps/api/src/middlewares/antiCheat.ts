@@ -60,8 +60,8 @@ export const detectSuspiciousPattern = async (
 export const logTapEvent = async (
   userId: number,
   event: TapEvent,
-  ip: string,
-  userAgent: string,
+  ip: string | null,
+  userAgent: string | null,
   suspicious: boolean = false,
 ) => {
   await db('tap_events').insert({
