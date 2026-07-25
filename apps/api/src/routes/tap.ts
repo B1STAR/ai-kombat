@@ -48,7 +48,6 @@ async function creditReferrerCommission(filleulId: number, coinsEarned: number):
       related_entity_id: filleulId,
     });
   } catch (err) {
-    // Log l'erreur — la commission sera perdue si la DB est down, au moins on a une trace
     logger.error({ err, filleulId }, 'referrer commission tap failed');
   }
 }
@@ -75,12 +74,16 @@ tap.post(
       }, 400);
     }
 
-    // Anti-cheat AVANT de consommer l'energie — tap suspect = rejet immediat sans cout
-    const ip = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
-    const userAgent = c.req.header('user-agent') || 'unknown';
+    // FIX: extract first IP from x-forwarded-for chain, fallback to null
+    // inet column does not accept arbitrary strings — null is safe (nullable column)
+    const rawIp = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
+               || c.req.header('x-real-ip')?.trim()
+               || null;
+
+    const userAgent = c.req.header('user-agent') || null;
     const { suspicious, reason } = await detectSuspiciousPattern(user.id, { count, clientTimestamp, durationMs });
 
-    await logTapEvent(user.id, { count, clientTimestamp, durationMs }, ip, userAgent, suspicious);
+    await logTapEvent(user.id, { count, clientTimestamp, durationMs }, rawIp, userAgent, suspicious);
 
     if (suspicious) {
       logger.warn({ userId: user.id, reason }, 'Tap suspect rejete sans consommer energie');
