@@ -7,12 +7,6 @@ import * as dotenv from 'dotenv';
 
 dotenv.config();
 
-// Upstash requires an HTTPS REST URL, not a redis:// protocol URL.
-// If the configured URL uses redis://, treat it as not set (local Redis is not compatible).
-const upstashUrl = process.env.UPSTASH_REDIS_REST_URL;
-const isUpstashConfigured =
-  upstashUrl && upstashUrl.startsWith('https://');
-
 const envSchema = z.object({
   // Server
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
@@ -22,8 +16,6 @@ const envSchema = z.object({
 
   // Telegram
   TELEGRAM_BOT_TOKEN: z.string().min(1, 'TELEGRAM_BOT_TOKEN is required'),
-  // Must match the exact @username WITHOUT the @ prefix.
-  // The bot username is @ai_kombatbot => value: ai_kombatbot
   TELEGRAM_BOT_USERNAME: z.string().default('ai_kombatbot'),
 
   // Database
@@ -32,13 +24,10 @@ const envSchema = z.object({
   SUPABASE_ANON_KEY: z.string().optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
 
-  // Cache (Upstash) — only valid if HTTPS REST URL, not local redis://
-  UPSTASH_REDIS_REST_URL: isUpstashConfigured
-    ? z.string().url()
-    : z.string().optional().transform(() => undefined),
-  UPSTASH_REDIS_REST_TOKEN: isUpstashConfigured
-    ? z.string().min(1)
-    : z.string().optional().transform(() => undefined),
+  // Cache — Redis local (ioredis)
+  // Format: redis://[:password@]host[:port][/db-number]
+  // Defaults to redis://127.0.0.1:6379 if not set
+  REDIS_URL: z.string().default('redis://127.0.0.1:6379'),
 
   // Auth
   JWT_SECRET: z.string().min(16).default('change-me-in-production-please-use-a-long-random-string'),

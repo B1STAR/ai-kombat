@@ -1,80 +1,75 @@
 /**
- * Rate limiting middleware using Upstash Redis.
- * Falls back silently (skip) if Upstash is not configured or URL is localhost.
- * Fail-open: si Redis injoignable, la requete passe (warn log une seule fois).
+ * Rate limiting middleware using ioredis (local Redis) + rate-limiter-flexible.
+ * Fail-open: si Redis est injoignable, la requête passe (warn loggé une seule fois).
  */
-import { Ratelimit } from '@upstash/ratelimit';
-import { Redis } from '@upstash/redis';
+import Redis from 'ioredis';
+import { RateLimiterRedis, RateLimiterMemory, type RateLimiterAbstract } from 'rate-limiter-flexible';
 import type { Context, Next } from 'hono';
 import { env } from '../lib/env';
 import { RateLimitError } from '../lib/errors';
 import { logger } from '../lib/logger';
 
-// Ne pas initialiser Upstash si l'URL est absente ou pointe sur localhost
-const upstashUrl = env.UPSTASH_REDIS_REST_URL ?? '';
-const upstashToken = env.UPSTASH_REDIS_REST_TOKEN ?? '';
-const isValidUpstash =
-  upstashUrl.startsWith('https://') &&
-  !upstashUrl.includes('localhost') &&
-  !upstashUrl.includes('127.0.0.1') &&
-  upstashToken.length > 0;
+// --- Client Redis (connexion lazy, reconnect automatique) ---
+const redisClient = new Redis(env.REDIS_URL, {
+  enableOfflineQueue: false,   // ne pas accumuler les cmds quand Redis est down
+  maxRetriesPerRequest: 1,     // timeout rapide pour le fail-open
+  lazyConnect: true,
+});
 
-let redis: Redis | null = null;
-if (isValidUpstash) {
+redisClient.on('connect', () => logger.info('Redis connected — rate limiting active'));
+redisClient.on('error', (err) => logger.warn({ err: err.message }, 'Redis error — rate limiting in memory fallback'));
+
+// Tentative de connexion au démarrage (non bloquante)
+redisClient.connect().catch(() => {
+  logger.warn('Redis unreachable at startup — using in-memory fallback');
+});
+
+// --- Fabrique de limiteur (Redis ou mémoire selon disponibilité) ---
+const makeLimiter = (
+  keyPrefix: string,
+  points: number,
+  duration: number, // secondes
+): RateLimiterAbstract => {
+  const opts = { keyPrefix, points, duration };
   try {
-    redis = new Redis({ url: upstashUrl, token: upstashToken });
-    logger.info('Upstash Redis rate limiter enabled');
-  } catch (e) {
-    logger.warn('Upstash Redis init failed, rate limiting disabled');
+    return new RateLimiterRedis({ storeClient: redisClient, ...opts,
+      insuranceLimiter: new RateLimiterMemory(opts), // fallback mémoire automatique
+    });
+  } catch {
+    return new RateLimiterMemory(opts);
   }
-} else {
-  logger.info('Upstash Redis not configured, rate limiting skipped');
-}
-
-const limits = {
-  tap: redis ? new Ratelimit({
-    redis,
-    limiter: Ratelimit.slidingWindow(5, '1 s'),
-    analytics: true,
-  }) : null,
-  quest: redis ? new Ratelimit({
-    redis,
-    limiter: Ratelimit.slidingWindow(10, '1 m'),
-    analytics: true,
-  }) : null,
-  ad: redis ? new Ratelimit({
-    redis,
-    limiter: Ratelimit.slidingWindow(3, '1 h'),
-    analytics: true,
-  }) : null,
-  general: redis ? new Ratelimit({
-    redis,
-    limiter: Ratelimit.slidingWindow(100, '1 m'),
-    analytics: true,
-  }) : null,
 };
 
+// --- Définition des limites ---
+const limits = {
+  tap:     makeLimiter('rl:tap',     5,   1),    // 5 req / 1 s
+  quest:   makeLimiter('rl:quest',   10,  60),   // 10 req / 1 min
+  ad:      makeLimiter('rl:ad',      3,   3600), // 3 req / 1 h
+  general: makeLimiter('rl:general', 100, 60),   // 100 req / 1 min
+} as const;
+
+// --- Middleware exporté ---
 export const rateLimit = (type: keyof typeof limits) => {
   return async (c: Context, next: Next) => {
     const user = c.get('telegramUser');
     if (!user) { await next(); return; }
 
     const limiter = limits[type];
-    if (!limiter) { await next(); return; }
 
     try {
-      const { success, remaining, reset } = await limiter.limit(`${type}:${user.id}`);
-      if (!success) {
+      const res = await limiter.consume(`${type}:${user.id}`);
+      c.header('X-RateLimit-Remaining', String(res.remainingPoints));
+      c.header('X-RateLimit-Reset', String(Date.now() + res.msBeforeNext));
+    } catch (err: unknown) {
+      // RateLimiterRes thrown when limit exceeded
+      if (err && typeof err === 'object' && 'remainingPoints' in err) {
+        const res = err as { msBeforeNext: number };
         throw new RateLimitError(
-          `Rate limit exceeded. Try again in ${Math.floor((reset - Date.now()) / 1000)}s`
+          `Rate limit exceeded. Try again in ${Math.ceil(res.msBeforeNext / 1000)}s`
         );
       }
-      c.header('X-RateLimit-Remaining', remaining.toString());
-      c.header('X-RateLimit-Reset', reset.toString());
-    } catch (err) {
-      if (err instanceof RateLimitError) throw err;
-      // Redis injoignable -> fail-open silencieux (pas de log warn repetitif)
-      logger.debug({ type }, 'Rate limiter unreachable, failing open');
+      // Autre erreur (Redis down, timeout) → fail-open
+      logger.debug({ type }, 'Rate limiter error, failing open');
     }
 
     await next();
