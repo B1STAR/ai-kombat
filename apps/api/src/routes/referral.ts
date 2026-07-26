@@ -13,9 +13,6 @@ const referral = new Hono();
 referral.get('/link', authMiddleware, async (c) => {
   const user = c.get('telegramUser');
 
-  // IMPORTANT: Telegram deep-link format requires the exact bot username
-  // (case-insensitive but must exist). Our bot is @ai_kombatbot.
-  // The ?start= payload is passed to the bot when the user opens it.
   const link = `https://t.me/${env.TELEGRAM_BOT_USERNAME}?start=ref_${user.id}`;
 
   return c.json({
@@ -41,17 +38,40 @@ referral.get('/list', authMiddleware, async (c) => {
       'referrals.bonus_paid_at',
     );
 
-  // Count earnings from referral bonuses in transactions table
-  const earningsRow = await db('transactions')
+  // Total des bonus d'invitation (500 coins immédiats)
+  const bonusRow = await db('transactions')
     .where({ user_id: user.id, type: 'referral_bonus' })
     .sum('amount as total')
     .first();
 
-  const totalEarned = Number(earningsRow?.total ?? 0);
+  // Total des commissions 10% passives
+  const commissionRow = await db('transactions')
+    .where({ user_id: user.id, type: 'referral_commission' })
+    .sum('amount as total')
+    .first();
+
+  // Commissions 10% cumulées par filleul
+  const commissionsByReferree = await db('transactions')
+    .where({ user_id: user.id, type: 'referral_commission' })
+    .select('metadata->referree_id as referree_id')
+    .sum('amount as total')
+    .groupBy('metadata->referree_id');
+
+  const commissionMap: Record<string, number> = {};
+  for (const row of commissionsByReferree) {
+    if (row.referree_id) {
+      commissionMap[String(row.referree_id)] = Number(row.total ?? 0);
+    }
+  }
+
+  const totalBonusEarned = Number(bonusRow?.total ?? 0);
+  const totalCommissionEarned = Number(commissionRow?.total ?? 0);
 
   return c.json({
     count: list.length,
-    totalEarned,
+    totalBonusEarned,
+    totalCommissionEarned,
+    totalEarned: totalBonusEarned + totalCommissionEarned,
     referrals: list.map((r: any) => ({
       telegramId: r.telegram_id,
       firstName: r.first_name,
@@ -60,6 +80,7 @@ referral.get('/list', authMiddleware, async (c) => {
       joinedAt: r.created_at,
       bonusPaid: r.bonus_paid,
       bonusPaidAt: r.bonus_paid_at,
+      commissionEarned: commissionMap[String(r.telegram_id)] ?? 0,
     })),
   });
 });

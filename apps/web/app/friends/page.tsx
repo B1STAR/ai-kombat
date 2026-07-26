@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Users, Copy, Share2, Check, Coins } from 'lucide-react';
+import { Users, Copy, Share2, Check, Coins, TrendingUp } from 'lucide-react';
 import { useApi } from '@/lib/api';
 import { BottomNav } from '@/components/BottomNav';
 import { useTelegram } from '@/lib/telegram';
@@ -19,11 +19,14 @@ interface ReferralListItem {
   username: string | null;
   joinedAt: string;
   bonusPaid: boolean;
+  commissionEarned: number;
 }
 
 interface ReferralData {
   count: number;
   totalEarned: number;
+  totalBonusEarned: number;
+  totalCommissionEarned: number;
   referrals: ReferralListItem[];
 }
 
@@ -31,7 +34,13 @@ export default function FriendsPage() {
   const api = useApi();
   const { user } = useTelegram();
   const [referral, setReferral] = useState<ReferralInfo | null>(null);
-  const [data, setData] = useState<ReferralData>({ count: 0, totalEarned: 0, referrals: [] });
+  const [data, setData] = useState<ReferralData>({
+    count: 0,
+    totalEarned: 0,
+    totalBonusEarned: 0,
+    totalCommissionEarned: 0,
+    referrals: [],
+  });
   const [copied, setCopied] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -79,17 +88,23 @@ export default function FriendsPage() {
       <h1 className="text-2xl font-bold mb-1">Invite Friends</h1>
       <p className="text-dark-300 text-sm mb-6">Earn 2,000 coins per friend + 10% of their gains</p>
 
-      {/* Stats row */}
-      <div className="grid grid-cols-2 gap-3 mb-4">
-        <div className="card text-center py-4">
-          <p className="text-2xl font-bold">{data.count}</p>
-          <p className="text-xs text-dark-300 mt-1">Friends invited</p>
+      {/* Stats row — 3 colonnes */}
+      <div className="grid grid-cols-3 gap-2 mb-4">
+        <div className="card text-center py-3 px-2">
+          <p className="text-xl font-bold">{data.count}</p>
+          <p className="text-xs text-dark-300 mt-1">Friends</p>
         </div>
-        <div className="card text-center py-4">
-          <p className="text-2xl font-bold text-accent-400">
-            {data.totalEarned.toLocaleString()}
+        <div className="card text-center py-3 px-2">
+          <p className="text-xl font-bold text-accent-400">
+            {data.totalBonusEarned.toLocaleString()}
           </p>
-          <p className="text-xs text-dark-300 mt-1">Coins earned</p>
+          <p className="text-xs text-dark-300 mt-1">Bonus 🎁</p>
+        </div>
+        <div className="card text-center py-3 px-2">
+          <p className="text-xl font-bold text-yellow-400">
+            {data.totalCommissionEarned.toLocaleString()}
+          </p>
+          <p className="text-xs text-dark-300 mt-1">10% gains 📈</p>
         </div>
       </div>
 
@@ -97,7 +112,6 @@ export default function FriendsPage() {
       <div className="card">
         <p className="text-xs text-dark-400 mb-1 font-medium uppercase tracking-wide">Your referral link</p>
 
-        {/* Link visible — affiche le lien en clair */}
         <div
           onClick={copyLink}
           className="flex items-center gap-2 bg-dark-800 rounded-lg px-3 py-2 mb-4 cursor-pointer hover:bg-dark-700 transition-colors"
@@ -135,7 +149,7 @@ export default function FriendsPage() {
         </div>
         <div className="flex items-start gap-2 text-sm text-dark-200">
           <span className="text-accent-400 font-bold">3.</span>
-          <span>You earn <strong className="text-accent-300">2,000 coins</strong> instantly + <strong className="text-accent-300">10%</strong> of all their tap earnings</span>
+          <span>You earn <strong className="text-accent-300">2,000 coins</strong> instantly + <strong className="text-yellow-300">10%</strong> of all their tap earnings, every hour</span>
         </div>
       </div>
 
@@ -157,10 +171,16 @@ export default function FriendsPage() {
                 <p className="font-medium truncate">{friend.firstName}</p>
                 <p className="text-xs text-dark-300">@{friend.username || 'no_username'}</p>
               </div>
-              <div className="text-right shrink-0">
-                {friend.bonusPaid ? (
-                  <span className="text-xs text-green-400 font-medium">✓ Bonus paid</span>
-                ) : (
+              <div className="text-right shrink-0 space-y-0.5">
+                {friend.bonusPaid && (
+                  <p className="text-xs text-green-400 font-medium">✓ +2 000 🎁</p>
+                )}
+                {friend.commissionEarned > 0 && (
+                  <p className="text-xs text-yellow-400 font-medium">
+                    +{friend.commissionEarned.toLocaleString()} 📈
+                  </p>
+                )}
+                {!friend.bonusPaid && friend.commissionEarned === 0 && (
                   <span className="text-xs text-dark-500">Pending</span>
                 )}
               </div>
