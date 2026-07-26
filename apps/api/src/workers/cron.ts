@@ -4,7 +4,10 @@
  * energyRegen : ne recharge PAS les users dont energy_exhausted_at est set
  * depuis moins de 30s. Apres le cooldown, recharge normalement et clear le flag.
  *
- * passiveIncome : credite 10% au parrain de chaque filleul actif.
+ * passiveIncome : credite les coins passifs au filleul (par minute).
+ *   Commission parrain : 10% du REVENU HORAIRE du filleul, versé 1x par heure max.
+ *   → Protection anti-spam : on vérifie la dernière commission versée dans transactions
+ *     (related_entity_id = filleul telegram_id, created_at > NOW() - INTERVAL '1 hour')
  */
 import { db } from '../db/knex';
 import { logger } from '../lib/logger';
@@ -32,7 +35,6 @@ const energyRegen = async () => {
     `);
 
     // Cas 2 : users en cooldown post-epuisement (>= 30s ecoulees)
-    // On recharge depuis le moment ou le cooldown s'est termine
     await db.raw(`
       UPDATE users
       SET
@@ -77,32 +79,49 @@ const passiveIncome = async () => {
       const perMinute = Math.floor(hourly / 60);
       if (perMinute <= 0) continue;
 
+      // Crédit passif au filleul
       await db('users')
         .where({ telegram_id: user.telegram_id })
         .increment('coin_balance', perMinute)
         .increment('total_earned_coins', perMinute);
 
+      // Commission parrain : versée 1x par heure maximum
       const referrerId = user.referred_by ? Number(user.referred_by) : null;
       if (referrerId) {
-        const commission = Math.floor(perMinute * 0.1);
-        if (commission > 0) {
-          try {
-            await db('users')
-              .where({ telegram_id: referrerId })
-              .increment('coin_balance', commission)
-              .increment('total_earned_coins', commission);
-            const referrer = await db('users').where({ telegram_id: referrerId }).first('coin_balance');
-            await db('transactions').insert({
-              user_id: referrerId,
-              type: 'referral_commission',
-              currency: 'coin',
-              amount: commission,
-              balance_after: Number(referrer?.coin_balance ?? commission),
-              related_entity_type: 'referral',
-              related_entity_id: user.telegram_id,
-            });
-          } catch (err) {
-            logger.debug({ err, referrerId }, 'Passive commission failed silently');
+        // Vérifier si une commission a déjà été versée dans la dernière heure pour ce filleul
+        const recentCommission = await db('transactions')
+          .where({
+            user_id: referrerId,
+            type: 'referral_commission',
+            related_entity_type: 'referral',
+            related_entity_id: user.telegram_id,
+          })
+          .where('created_at', '>', db.raw("NOW() - INTERVAL '1 hour'"))
+          .first();
+
+        if (!recentCommission) {
+          // Commission = 10% du revenu horaire du filleul (et non pas du revenu/minute)
+          const commission = Math.floor(hourly * 0.1);
+          if (commission > 0) {
+            try {
+              await db('users')
+                .where({ telegram_id: referrerId })
+                .increment('coin_balance', commission)
+                .increment('total_earned_coins', commission);
+              const referrer = await db('users').where({ telegram_id: referrerId }).first('coin_balance');
+              await db('transactions').insert({
+                user_id: referrerId,
+                type: 'referral_commission',
+                currency: 'coin',
+                amount: commission,
+                balance_after: Number(referrer?.coin_balance ?? commission),
+                related_entity_type: 'referral',
+                related_entity_id: user.telegram_id,
+              });
+              logger.debug({ referrerId, filleulId: user.telegram_id, commission }, 'Referral commission versée (hourly)');
+            } catch (err) {
+              logger.debug({ err, referrerId }, 'Passive commission failed silently');
+            }
           }
         }
       }
