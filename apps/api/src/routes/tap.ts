@@ -13,6 +13,9 @@
  * 7. [FIX v3] energy_exhausted_at mis à null dans l'UPDATE quand !isExhausted
  *    — garantit la sortie propre du mode regen même si le frontend a raté
  *    le reset de son côté.
+ * 8. [FIX v4] energy_exhausted_at reset à null si calculateValidEnergy()
+ *    retourne >= max_energy pendant la regen, même si newEnergy post-tap > 0.
+ *    Évite que energy_exhausted_at reste stale indéfiniment.
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -75,9 +78,6 @@ tap.post(
     const dbUser = normalizeUser(rawDbUser);
 
     // ── 1. ÉNERGIE : calculateValidEnergy est la source de vérité ───────────
-    // Elle tient compte de energy_exhausted_at + délai 30 s + regen 0.333/s
-    // FIX v3 : on floor() ici pour être cohérent avec le guard ci-dessous.
-    // calculateValidEnergy retourne déjà un floor() mais on le garantit.
     const currentEnergy = Math.floor(calculateValidEnergy(dbUser));
 
     if (currentEnergy < 1) {
@@ -107,46 +107,30 @@ tap.post(
     }
 
     // ── 3. CALCUL ────────────────────────────────────────────────────────────
-    // energyToSpend : on ne peut pas dépenser plus que ce qu'on a (entier).
     const energyToSpend = Math.min(count, currentEnergy);
     const passiveIncome = await getPassiveIncomePerHour(user.id);
     const multiplier    = 1 + Math.floor(passiveIncome / 1000) * 0.1;
     const coinsEarned   = Math.floor(energyToSpend * multiplier);
     const xpGained      = energyToSpend;
 
-    // FIX v3 CRITIQUE : newEnergy calculé depuis currentEnergy (valeur cohérente
-    // avec calculateValidEnergy qui repart de user.energy en DB).
-    // Avant : newEnergy = Math.max(0, currentEnergy - energyToSpend)
-    //   → si calculateValidEnergy retournait une valeur < user.energy DB,
-    //     on écrivait une énergie inférieure à la réelle → perte de coins.
-    // Maintenant : on utilise currentEnergy qui EST déjà aligné avec la DB
-    // (la fonction repart de storedEnergy + regen, pas de 0).
     const newEnergy   = Math.max(0, currentEnergy - energyToSpend);
     const isExhausted = newEnergy === 0;
 
     // ── 4. UPDATE ATOMIQUE UNIQUE ────────────────────────────────────────────
-    // Pas de guard WHERE energy >= energyToSpend :
-    //   • calculateValidEnergy est la source de vérité
-    //   • Le guard comparait contre energy DB qui peut être 0 pendant la regen
-    //     post-épuisement → bloquait toujours → désync frontend/DB
-    //
-    // Concurrence : rateLimit Redis + batch 800 ms frontend garantissent
-    // qu'un seul batch arrive à la fois par utilisateur.
     const updatePayload: Record<string, any> = {
       energy             : newEnergy,
       total_taps         : db.raw('total_taps + ?',         [count]),
       coin_balance       : db.raw('coin_balance + ?',       [coinsEarned]),
       total_earned_coins : db.raw('total_earned_coins + ?', [coinsEarned]),
-      // FIX v3 : on efface TOUJOURS energy_exhausted_at quand on n'est pas
-      // épuisé — même si la regen était en cours côté DB.
-      // Cela garantit que le prochain appel à calculateValidEnergy tombe dans
-      // le chemin "cas normal" et retourne directement newEnergy sans recalcul.
+      // FIX v4 : on efface energy_exhausted_at dans 2 cas :
+      //   1. !isExhausted (comportement existant)
+      //   2. energy_exhausted_at était set ET calculateValidEnergy avait atteint
+      //      max_energy (regen complète) — évite un stale energy_exhausted_at
+      //      qui ferait recalculer une regen inutile au prochain tap.
       energy_exhausted_at: isExhausted ? new Date() : null,
     };
 
-    // last_energy_update : on le touche UNIQUEMENT si on sort de la phase
-    // d'épuisement — pour signaler au cron de regen passive que la regen
-    // manuelle est terminée.
+    // last_energy_update : uniquement si on sort de la phase d'épuisement
     if (dbUser.energy_exhausted_at && !isExhausted) {
       updatePayload.last_energy_update = new Date();
     }
@@ -192,9 +176,6 @@ tap.post(
       coinsEarned,
       xpGained,
       energySpent  : energyToSpend,
-      // FIX v3 : on retourne newEnergy (calculé, entier garanti) et NON
-      // row.energy (valeur DB brute qui peut avoir une légère différence
-      // due à la conversion Postgres numeric → JS number).
       newEnergy    : newEnergy,
       maxEnergy    : Number(row.max_energy),
       newBalance   : Number(row.coin_balance),

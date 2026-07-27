@@ -169,12 +169,8 @@ export default function GamePage() {
       displayEnergyRef.current = newE;
       setDisplayEnergy(newE);
 
-      // FIX #1 — CRITIQUE : dès que l'énergie remonte à >= 1,
-      // on efface exhaustedAtRef. C'est le timer qui pilote la regen
-      // locale → c'est lui qui doit signaler la fin de l'épuisement.
-      // Sans ce reset, l'API continue de voir energy_exhausted_at set
-      // côté DB et retourne newEnergy=0 ou ~1 à chaque batch
-      // → frontend a crédité N coins, API n'en écrit que 1 → désync.
+      // Dès que l'énergie remonte à >= 1,
+      // on efface exhaustedAtRef pour signaler la fin de l'épuisement.
       if (Math.floor(newE) >= 1 && exhaustedAtRef.current !== null) {
         exhaustedAtRef.current = null;
       }
@@ -223,31 +219,67 @@ export default function GamePage() {
           durationMs,
         });
 
-        // Source de vérité : valeurs directement issues du RETURNING DB
+        // Source de vérité pour balance et taps : toujours DB
         displayBalanceRef.current = response.newBalance;
         displayTapsRef.current    = response.newTotalTaps;
         setDisplayBalance(response.newBalance);
         setDisplayTaps(response.newTotalTaps);
 
-        // FIX #3 — double-sécurité sur exhaustedAtRef après réponse API
-        // Si l'API confirme que l'énergie est > 0, on s'assure que
-        // exhaustedAtRef est null (peut avoir été raté par le timer
-        // si le batch part exactement au moment du premier tick regen)
-        if (response.newEnergy > 0) {
-          if (exhaustedAtRef.current !== null) {
-            exhaustedAtRef.current = null;
-          }
-          displayEnergyRef.current = response.newEnergy;
-          setDisplayEnergy(response.newEnergy);
-        } else {
-          // newEnergy = 0 → épuisement confirmé par le serveur
+        // ── ÉNERGIE : FIX ANTI-SAUT ──────────────────────────────────────
+        // PROBLÈME RACINE du nouveau symptôme :
+        //   Le timer tick() incrémente displayEnergyRef toutes les 500ms.
+        //   Pendant le vol du batch (~1s), il a peut-être monté displayEnergyRef
+        //   de 200 → 205 (regen normale) OU de ~200 → 600 (si on tapait depuis
+        //   le début et que le timer accumule les ticks).
+        //   Si on écrase displayEnergyRef avec response.newEnergy (ex. 190),
+        //   on crée un saut brutal 600 → 190 visible à l'écran.
+        //
+        // RÈGLE :
+        //   - Si response.newEnergy = 0 → épuisement confirmé serveur → on force 0.
+        //   - Si response.newEnergy > 0 → on prend le MAX entre la valeur locale
+        //     (avancée par le timer) et la valeur DB (source de vérité basse).
+        //     Le timer a avancé légitimement pendant la latence réseau (~1s de regen)
+        //     donc sa valeur est plus précise pour l'affichage temps réel.
+        //     On met quand même le store Zustand à jour avec response.newEnergy
+        //     pour que la DB reste cohérente.
+        if (response.newEnergy <= 0) {
+          // Épuisement confirmé par le serveur
           displayEnergyRef.current = 0;
           setDisplayEnergy(0);
           if (exhaustedAtRef.current === null) {
             exhaustedAtRef.current = Date.now();
           }
+        } else {
+          // FIX : on ne recule JAMAIS l'énergie display vers une valeur DB
+          // inférieure à ce que le timer local a déjà affiché.
+          // Exception : si l'écart est > 5 points (désync significative),
+          // on recale sur la valeur DB pour éviter une dérive long-terme.
+          const localEnergy = displayEnergyRef.current;
+          const dbEnergy    = response.newEnergy;
+          const maxE        = maxEnergyRef.current;
+
+          if (localEnergy > dbEnergy + 5) {
+            // Désync significative : le display local est trop haut par rapport
+            // à la DB → recalage doux vers la valeur DB confirmée.
+            // Cela arrive si des taps ont été perdus ou rejetés côté serveur.
+            displayEnergyRef.current = dbEnergy;
+            setDisplayEnergy(dbEnergy);
+          } else if (localEnergy < dbEnergy) {
+            // DB confirme une énergie plus haute que le display local
+            // (ex. regen cron passée côté serveur) → on prend la valeur DB.
+            displayEnergyRef.current = Math.min(dbEnergy, maxE);
+            setDisplayEnergy(Math.min(dbEnergy, maxE));
+          }
+          // Sinon : local >= dbEnergy et écart <= 5 → on garde local,
+          // le timer est source de vérité pour l'affichage temps réel.
+
+          // Garantir que exhaustedAtRef est null si énergie > 0
+          if (exhaustedAtRef.current !== null) {
+            exhaustedAtRef.current = null;
+          }
         }
 
+        // Sync store Zustand avec les valeurs DB confirmées
         const latest = userRef.current;
         if (latest) {
           const synced = {
@@ -280,9 +312,7 @@ export default function GamePage() {
     if (e.type === 'click'       && Date.now() - lastTouchRef.current < 500) return;
     if (e.type === 'touchstart')   lastTouchRef.current = Date.now();
 
-    // FIX #2 — Math.floor pour éviter qu'un float 0.83 passe le guard
-    // pendant la regen (le bouton est disabled visuellement mais
-    // un tap rapide peut arriver avant que React re-render le disabled)
+    // Math.floor pour éviter qu'un float 0.83 passe le guard
     const energy = Math.floor(displayEnergyRef.current);
     if (energy < 1) { hapticNotification('error'); return; }
 
