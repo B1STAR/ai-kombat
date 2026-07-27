@@ -60,8 +60,6 @@ export default function GamePage() {
   const displayTapsRef    = useRef<number>(0);
   const displayEnergyRef  = useRef<number>(0);
 
-  // Sync balance/taps depuis le store uniquement quand aucun tap n'est en vol.
-  // L'\u00e9nergie est g\u00e9r\u00e9e exclusivement par tick() et flushBatch.
   useEffect(() => {
     if (!user) return;
     if (tapPendingRef.current === 0 && batchInFlightRef.current === null) {
@@ -82,14 +80,7 @@ export default function GamePage() {
   const batchSentAtRef    = useRef<number>(0);
 
   // ----------------------------------------------------------------
-  // Init
-  // FIX RACINE : exhaustedAtRef ancr\u00e9 sur energy_exhausted_at DB.
-  // Avant : exhaustedAtRef = Date.now() si energy <= 0
-  //   \u2192 le d\u00e9lai 30s repartait de z\u00e9ro \u00e0 chaque reconnexion/changement de section.
-  // Apr\u00e8s : exhaustedAtRef = timestamp DB r\u00e9el
-  //   \u2192 le timer reprend exactement l\u00e0 o\u00f9 il en \u00e9tait.
-  // Pareil pour displayEnergyRef : on utilise calculateValidEnergy
-  //   c\u00f4t\u00e9 client pour reconstruire l'\u00e9nergie exacte au moment de la reconnexion.
+  // Init — exhaustedAtRef ancré sur energy_exhausted_at DB (fix racine)
   // ----------------------------------------------------------------
   useEffect(() => {
     if (!isReady) return;
@@ -106,21 +97,12 @@ export default function GamePage() {
         setDisplayBalance(u.coin_balance);
         setDisplayTaps(u.total_taps);
 
-        // --- Reconstruire l'\u00e9tat d'\u00e9nergie depuis les timestamps DB ---
-        // Le serveur retourne maintenant energy_exhausted_at dans le DTO.
-        // On recalcule l'\u00e9nergie c\u00f4t\u00e9 client exactement comme le serveur le ferait,
-        // ce qui garantit la continuit\u00e9 de la regen m\u00eame apr\u00e8s d\u00e9connexion.
         if (u.energy_exhausted_at) {
-          // L'\u00e9nergie \u00e9tait \u00e9puis\u00e9e : on ancre exhaustedAtRef sur le vrai timestamp
           exhaustedAtRef.current = new Date(u.energy_exhausted_at).getTime();
-
-          // Recalcul c\u00f4t\u00e9 client : est-ce que la regen a d\u00e9j\u00e0 commenc\u00e9 ?
-          const now            = Date.now();
-          const exhaustedAt    = exhaustedAtRef.current;
-          const regenStartAt   = exhaustedAt + REGEN_DELAY_MS;
+          const now          = Date.now();
+          const regenStartAt = exhaustedAtRef.current + REGEN_DELAY_MS;
 
           if (now >= regenStartAt) {
-            // La regen est en cours : on calcule l'\u00e9nergie exacte
             const secondsPassed = (now - regenStartAt) / 1000;
             const regenedEnergy = Math.min(
               u.max_energy,
@@ -128,17 +110,14 @@ export default function GamePage() {
             );
             displayEnergyRef.current = regenedEnergy;
             setDisplayEnergy(regenedEnergy);
-            // Si la regen est d\u00e9j\u00e0 compl\u00e8te, on lib\u00e8re exhaustedAtRef
             if (Math.floor(regenedEnergy) >= u.max_energy) {
               exhaustedAtRef.current = null;
             }
           } else {
-            // Encore dans le d\u00e9lai de 30s : \u00e9nergie = 0 (ou valeur DB)
             displayEnergyRef.current = Math.max(0, u.energy);
             setDisplayEnergy(Math.max(0, u.energy));
           }
         } else {
-          // Cas normal : pas d'\u00e9puisement en cours
           exhaustedAtRef.current   = null;
           displayEnergyRef.current = u.energy;
           setDisplayEnergy(u.energy);
@@ -170,8 +149,7 @@ export default function GamePage() {
   }, [isReady, initData]);
 
   // ----------------------------------------------------------------
-  // Timer regen \u2014 cr\u00e9\u00e9 une seule fois, lit UNIQUEMENT les refs display.
-  // Ne touche PAS le store Zustand (Fix B).
+  // Timer regen
   // ----------------------------------------------------------------
   const lastTickRef = useRef<number>(Date.now());
 
@@ -238,14 +216,12 @@ export default function GamePage() {
           durationMs,
         });
 
-        // Pr\u00e9server les taps arriv\u00e9s pendant le vol r\u00e9seau
         const pendingAfter = tapPendingRef.current;
         displayBalanceRef.current = response.newBalance   + pendingAfter;
         displayTapsRef.current    = response.newTotalTaps + pendingAfter;
         setDisplayBalance(response.newBalance   + pendingAfter);
         setDisplayTaps(response.newTotalTaps    + pendingAfter);
 
-        // Energie post-flush ancr\u00e9e sur le temps de vol r\u00e9seau (Fix C)
         if (response.newEnergy <= 0) {
           displayEnergyRef.current = 0;
           setDisplayEnergy(0);
@@ -287,7 +263,7 @@ export default function GamePage() {
         }
         if (response.aiLevelUp) hapticNotification('success');
       } catch {
-        // Pas de rollback : la DB est s\u00fbre (UPDATE atomique)
+        // pas de rollback
       } finally {
         batchInFlightRef.current = null;
       }
@@ -298,7 +274,7 @@ export default function GamePage() {
   };
 
   // ----------------------------------------------------------------
-  // handleTap \u2014 onPointerDown (Fix A : pas de doublon mobile)
+  // handleTap
   // ----------------------------------------------------------------
   const handleTap = useCallback((e: React.PointerEvent) => {
     if (e.isPrimary === false) return;
@@ -358,7 +334,7 @@ export default function GamePage() {
     : 'from-red-700 to-red-500';
 
   const isExhausted = Math.floor(displayEnergy) < 1;
-  const regenLabel  = isExhausted ? 'Recharge en cours\u2026' : 'Tap to train';
+  const regenLabel  = isExhausted ? 'Recharge en cours…' : 'Tap to train';
   const regenSub    = isExhausted ? '' : '+1 coin par tap';
 
   return (
@@ -393,7 +369,7 @@ export default function GamePage() {
       <div className="flex justify-center items-center gap-3 pt-1 pb-3">
         <div className="w-10 h-10 rounded-full flex items-center justify-center"
           style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}>
-          <span className="text-lg">\u{1FA99}</span>
+          <span className="text-lg">🪙</span>
         </div>
         <span className="text-4xl font-extrabold text-white tracking-tight">{fmt(displayBalance)}</span>
       </div>
@@ -419,7 +395,7 @@ export default function GamePage() {
       <div className="px-4 mb-4">
         <div className="flex items-center justify-between mb-1.5">
           <div className="flex items-center gap-1.5">
-            <span className="text-sm">\u26A1</span>
+            <span className="text-sm">⚡</span>
             <span className="text-sm font-semibold text-white">{Math.floor(displayEnergy)}</span>
             <span className="text-xs text-slate-500">/ {maxEnergy}</span>
           </div>
