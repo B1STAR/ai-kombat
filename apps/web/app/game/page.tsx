@@ -61,8 +61,11 @@ export default function GamePage() {
   const displayTapsRef    = useRef<number>(0);
   const displayEnergyRef  = useRef<number>(0);
 
-  // Sync depuis le store uniquement quand aucun tap n'est en vol
-  // et que la valeur DB diffère significativement du display local
+  // Sync depuis le store uniquement quand aucun tap n'est en vol.
+  // FIX #1 : user?.energy retiré des dépendances — le timer tick() met à jour
+  // user.energy dans Zustand toutes les 500ms, ce qui retriggère ce useEffect
+  // et écrase displayEnergyRef au mauvais moment (race condition).
+  // L'énergie display est désormais gérée UNIQUEMENT par le timer et flushBatch.
   useEffect(() => {
     if (!user) return;
     if (tapPendingRef.current === 0 && batchInFlightRef.current === null) {
@@ -70,14 +73,8 @@ export default function GamePage() {
       displayTapsRef.current    = user.total_taps;
       setDisplayBalance(user.coin_balance);
       setDisplayTaps(user.total_taps);
-      // Énergie : sync depuis store seulement si pas en regen locale active
-      // (évite d'écraser une regen en cours par une vieille valeur du store)
-      if (exhaustedAtRef.current === null) {
-        displayEnergyRef.current = user.energy;
-        setDisplayEnergy(user.energy);
-      }
     }
-  }, [user?.coin_balance, user?.total_taps, user?.energy]);
+  }, [user?.coin_balance, user?.total_taps]);
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
 
@@ -219,31 +216,24 @@ export default function GamePage() {
           durationMs,
         });
 
-        // Source de vérité pour balance et taps : toujours DB
-        displayBalanceRef.current = response.newBalance;
-        displayTapsRef.current    = response.newTotalTaps;
-        setDisplayBalance(response.newBalance);
-        setDisplayTaps(response.newTotalTaps);
+        // FIX #2 : préserver les taps arrivés PENDANT le vol réseau.
+        // tapPendingRef.current contient les taps accumulés depuis que
+        // batchCount a été capturé (tapPendingRef = 0). Ces taps sont
+        // déjà déduits localement dans displayBalanceRef/displayTapsRef
+        // mais la réponse DB ne les connaît pas encore → on les rajoute
+        // pour éviter que le display recule visuellement.
+        const pendingAfter = tapPendingRef.current;
+        displayBalanceRef.current = response.newBalance   + pendingAfter;
+        displayTapsRef.current    = response.newTotalTaps + pendingAfter;
+        setDisplayBalance(response.newBalance   + pendingAfter);
+        setDisplayTaps(response.newTotalTaps    + pendingAfter);
 
         // ── ÉNERGIE : FIX ANTI-SAUT ──────────────────────────────────────
         //
-        // PROBLÈME RACINE :
-        //   L'ancien seuil fixe de +5 déclenchait un recalage brutal dès que
-        //   le batch dépassait ~5 taps. Ex : batch de 50 taps → DB retourne
-        //   currentEnergy - 50 = 150 alors que le display local est à 200
-        //   (valeur avant tap). L'écart légitime = batchCount = 50 >> 5.
-        //   → Recalage brutal 200 → 150 visible à l'écran.
-        //
-        // FIX :
-        //   Le seuil de désync est maintenant adaptatif :
-        //     tolérance = batchCount + marge_regen_réseau
-        //   où marge_regen_réseau = 2s de regen max ≈ 0.67 point ≈ 2 points
-        //   arrondi généreusement à 5 pour absorber la latence.
-        //
-        //   Un écart local - DB > tolérance signifie que des taps ont été
-        //   rejetés ou perdus côté serveur → recalage justifié.
-        //   Un écart local - DB <= tolérance → on garde le display local,
-        //   source de vérité pour le temps réel.
+        // Le seuil de désync est adaptatif :
+        //   tolérance = batchCount + 5 (marge regen latence réseau)
+        // Un écart local - DB > tolérance → recalage justifié (taps rejetés).
+        // Un écart local - DB <= tolérance → on garde le display local.
 
         if (response.newEnergy <= 0) {
           // Épuisement confirmé par le serveur
@@ -263,7 +253,6 @@ export default function GamePage() {
 
           if (localEnergy > dbEnergy + tolerance) {
             // Désync réelle : des taps ont été perdus/rejetés côté serveur.
-            // Recalage sur la valeur DB confirmée.
             displayEnergyRef.current = dbEnergy;
             setDisplayEnergy(dbEnergy);
           } else if (localEnergy < dbEnergy) {
