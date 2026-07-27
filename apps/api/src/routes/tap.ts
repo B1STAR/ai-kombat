@@ -6,6 +6,9 @@
  * 2. calculateValidEnergy() appelé UNE SEULE FOIS, résultat réutilisé
  * 3. SELECT post-UPDATE supprimé : RETURNING retourne les valeurs exactes du UPDATE
  * 4. energy_exhausted_at géré correctement dans tous les cas
+ * 5. [FIX CRITIQUE] last_energy_update N'EST PLUS touché lors d'un tap
+ *    → seule la regen (passive) doit mettre à jour ce champ
+ *    → sinon calculateValidEnergy repart de 0 à chaque batch et sous-estime l'énergie
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -60,14 +63,14 @@ tap.post(
   rateLimit('tap'),
   zValidator('json', tapSchema),
   async (c) => {
-    const user     = c.get('telegramUser');
+    const user      = c.get('telegramUser');
     const rawDbUser = c.get('dbUser');
     const { count, clientTimestamp, durationMs } = c.req.valid('json');
 
     if (!rawDbUser) return c.json({ error: 'User not found' }, 404);
     const dbUser = normalizeUser(rawDbUser);
 
-    // --- 1. ENERGIE : calculé une seule fois ici, jamais relue depuis la DB ensuite ---
+    // --- 1. ENERGIE : calculé une seule fois depuis l'état DB en cache middleware ---
     const currentEnergy = calculateValidEnergy(dbUser);
     if (currentEnergy < 1) {
       return c.json({
@@ -77,9 +80,7 @@ tap.post(
       }, 400);
     }
 
-    // --- 2. ANTI-TRICHE : on passe durationMs (durée réelle du batch côté client) ---
-    // Le middleware analyse le rythme des TAPS individuels (count/durationMs)
-    // et non la régularité des appels batch qui sont forcément réguliers.
+    // --- 2. ANTI-TRICHE ---
     const rawIp    = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
                   || c.req.header('x-real-ip')?.trim()
                   || null;
@@ -90,7 +91,6 @@ tap.post(
       { count, clientTimestamp, durationMs },
     );
 
-    // Log AVANT la décision (pour audit)
     await logTapEvent(user.id, { count, clientTimestamp, durationMs }, rawIp, userAgent, suspicious);
 
     if (suspicious) {
@@ -108,28 +108,29 @@ tap.post(
     const isExhausted   = newEnergy === 0;
 
     // --- 4. UPDATE ATOMIQUE + RETURNING ---
-    // On n’utilise PAS de SELECT après : RETURNING retourne exactement
-    // les valeurs écrites par CE UPDATE, pas une lecture post-race.
+    // [FIX CRITIQUE] last_energy_update N'EST PAS mis à jour ici.
+    // Ce champ doit rester à la valeur de la DERNIÈRE REGEN, pas du dernier tap.
+    // Si on l'écrase à chaque tap avec NOW(), calculateValidEnergy croira que la regen
+    // vient de démarrer → sous-estime l'énergie → le guard energy bloque → désync.
+    //
+    // last_energy_update est géré UNIQUEMENT par le système de regen passive
+    // (cron ou endpoint dédié), jamais ici.
     const updatePayload: Record<string, any> = {
       energy             : newEnergy,
-      last_energy_update : new Date(),
+      // last_energy_update : intentionnellement absent — voir commentaire ci-dessus
       total_taps         : db.raw('total_taps + ?',         [count]),
       coin_balance       : db.raw('coin_balance + ?',       [coinsEarned]),
       total_earned_coins : db.raw('total_earned_coins + ?', [coinsEarned]),
     };
 
     if (isExhausted) {
-      // Marquer l'heure d'épuisement pour déclencher le délai de regen
       updatePayload.energy_exhausted_at = new Date();
     } else {
-      // L'énergie n'est pas à zéro : effacer energy_exhausted_at si présent
       updatePayload.energy_exhausted_at = null;
     }
 
     const updatedRows = await db('users')
       .where({ telegram_id: user.id })
-      // Guard atomique : vérifie que l'énergie en DB est encore suffisante
-      // (protection contre race condition si deux batchs arrivent en même temps)
       .whereRaw('energy >= ?', [energyToSpend])
       .update(updatePayload)
       .returning([
@@ -142,15 +143,13 @@ tap.post(
       ]);
 
     if (!updatedRows || updatedRows.length === 0) {
-      // Guard a bloqué : l'énergie a été consommée entre le calcul et le UPDATE
-      // (très rare — double-batch simultané). On relit l'état réel.
       const fresh = await db('users')
         .where({ telegram_id: user.id })
         .first('energy', 'max_energy', 'coin_balance', 'total_taps');
       return c.json({
-        error    : 'Insufficient energy',
-        newEnergy: fresh ? Math.floor(Number(fresh.energy)) : 0,
-        maxEnergy: dbUser.max_energy,
+        error       : 'Insufficient energy',
+        newEnergy   : fresh ? Math.floor(Number(fresh.energy)) : 0,
+        maxEnergy   : dbUser.max_energy,
         newBalance  : fresh ? Number(fresh.coin_balance) : dbUser.coin_balance,
         newTotalTaps: fresh ? Number(fresh.total_taps)   : dbUser.total_taps,
       }, 400);
@@ -177,7 +176,6 @@ tap.post(
     // XP (peut changer ai_level)
     const { leveledUp, newLevel } = await addXp(user.id, xpGained);
 
-    // Réponse : toutes les valeurs viennent du RETURNING, pas d’un SELECT
     return c.json({
       coinsEarned,
       xpGained,
