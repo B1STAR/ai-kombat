@@ -65,9 +65,9 @@ export default function GamePage() {
   // Il est UNIQUEMENT mis à jour par les réponses /api/tap et /api/auth/init.
   const serverExhaustedAtRef = useRef<number | null>(null);
 
-  const tapPendingRef    = useRef(0);
-  const batchTimerRef    = useRef<NodeJS.Timeout>();
-  const batchInFlightRef = useRef<Promise<void> | null>(null);
+  const tapPendingRef     = useRef(0);
+  const batchTimerRef     = useRef<NodeJS.Timeout>();
+  const batchInFlightRef  = useRef<Promise<void> | null>(null);
   const batchStartTimeRef = useRef<number>(0);
   const batchSentAtRef    = useRef<number>(0);
 
@@ -173,6 +173,57 @@ export default function GamePage() {
     };
     init();
   }, [isReady, initData, rebuildEnergyFromServer]);
+
+  // ----------------------------------------------------------------
+  // Flush forcé avant quitter la page (visibilitychange + démontage)
+  // Garantit que energy_exhausted_at est en DB avant le prochain init.
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    // sendBeacon : fire-and-forget, survit à l'unload de la page
+    const flushViaSendBeacon = () => {
+      if (tapPendingRef.current === 0) return;
+      const count       = tapPendingRef.current;
+      const durationMs  = batchStartTimeRef.current > 0
+        ? Date.now() - batchStartTimeRef.current
+        : undefined;
+      // sendBeacon ne supporte que URLSearchParams ou Blob
+      const body = JSON.stringify({
+        count,
+        clientTimestamp: new Date().toISOString(),
+        durationMs,
+      });
+      // On tente sendBeacon via l'URL absolue de l'API
+      const apiBase = process.env.NEXT_PUBLIC_API_URL ?? '';
+      const sent = navigator.sendBeacon(
+        `${apiBase}/api/tap`,
+        new Blob([body], { type: 'application/json' }),
+      );
+      if (sent) {
+        tapPendingRef.current     = 0;
+        batchStartTimeRef.current = 0;
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        // 1. Tenter sendBeacon (fire-and-forget)
+        flushViaSendBeacon();
+        // 2. Annuler le timer batch en attente
+        clearTimeout(batchTimerRef.current);
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      // Cleanup au démontage : annuler le timer + flush si taps en attente
+      clearTimeout(batchTimerRef.current);
+      if (tapPendingRef.current > 0) {
+        flushBatchRef.current?.();
+      }
+    };
+  }, []);
 
   // ----------------------------------------------------------------
   // Timer regen — tic toutes les 500ms
