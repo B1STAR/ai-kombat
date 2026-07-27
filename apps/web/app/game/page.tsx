@@ -39,31 +39,21 @@ function AiBadge({ level, type }: { level: number; type: string }) {
 }
 
 export default function GamePage() {
-  const api            = useApi();
+  const api = useApi();
   const { isTelegram, initData, startParam, isReady } = useTelegram();
   const { user, setUser } = useGameStore();
 
-  // Refs stables \u2014 aucune stale closure possible
-  const apiRef      = useRef(api);
-  const setUserRef  = useRef(setUser);
-  const userRef     = useRef(user);
+  const apiRef     = useRef(api);
+  const setUserRef = useRef(setUser);
+  const userRef    = useRef(user);
   useEffect(() => { apiRef.current    = api;     }, [api]);
   useEffect(() => { setUserRef.current = setUser; }, [setUser]);
   useEffect(() => { userRef.current   = user;    }, [user]);
 
-  // FIX #4 : maxEnergy dans une ref pour que le timer le lise toujours à jour
-  // sans avoir besoin de recréer le setInterval
   const maxEnergyRef = useRef<number>(1000);
-  useEffect(() => {
-    if (user?.max_energy) maxEnergyRef.current = user.max_energy;
-  }, [user?.max_energy]);
+  useEffect(() => { if (user?.max_energy) maxEnergyRef.current = user.max_energy; }, [user?.max_energy]);
 
-  // ----------------------------------------------------------------
-  // Compteurs VISUELS locaux \u2014 séparés du store DB
-  // \u2022 Tap        \u2192 incrément instantané (UX fluide)
-  // \u2022 Réponse API \u2192 remplacement direct par la vraie valeur DB
-  // \u2022 Jamais de rollback
-  // ----------------------------------------------------------------
+  // Compteurs visuels locaux — séparés du store DB
   const [displayBalance, setDisplayBalance] = useState<number>(0);
   const [displayTaps,    setDisplayTaps]    = useState<number>(0);
   const [displayEnergy,  setDisplayEnergy]  = useState<number>(0);
@@ -71,14 +61,11 @@ export default function GamePage() {
   const displayTapsRef    = useRef<number>(0);
   const displayEnergyRef  = useRef<number>(0);
 
-  // Sync display depuis le store uniquement quand aucun tap n'est en attente
   useEffect(() => {
     if (!user) return;
     if (tapPendingRef.current === 0) {
       displayBalanceRef.current = user.coin_balance;
       displayTapsRef.current    = user.total_taps;
-      // FIX #5 : énergie syncée depuis le store seulement si pas de tap en cours
-      // pour éviter le conflit avec displayEnergyRef déjà mis à jour par le timer
       displayEnergyRef.current  = user.energy;
       setDisplayBalance(user.coin_balance);
       setDisplayTaps(user.total_taps);
@@ -92,10 +79,10 @@ export default function GamePage() {
   const tapPendingRef    = useRef(0);
   const batchTimerRef    = useRef<NodeJS.Timeout>();
   const batchInFlightRef = useRef<Promise<void> | null>(null);
+  const exhaustedAtRef   = useRef<number | null>(null);
 
-  // FIX #1 : exhaustedAtRef géré UNIQUEMENT par handleTap et flushBatch
-  // Le timer ne le touche PLUS \u2014 évite le reset intempestif entre deux ticks
-  const exhaustedAtRef = useRef<number | null>(null);
+  // durationMs : on mesure la durée réelle du batch pour l’anti-triche
+  const batchStartTimeRef = useRef<number>(0);
 
   // ----------------------------------------------------------------
   // Init
@@ -116,7 +103,6 @@ export default function GamePage() {
         setDisplayBalance(u.coin_balance);
         setDisplayTaps(u.total_taps);
         setDisplayEnergy(u.energy);
-        // Initialiser exhaustedAt si l'énergie est déjà à 0 au chargement
         if (u.energy <= 0) exhaustedAtRef.current = Date.now();
       } catch {
         if (!isTelegram) {
@@ -143,11 +129,7 @@ export default function GamePage() {
   }, [isReady, initData]);
 
   // ----------------------------------------------------------------
-  // Timer regen \u2014 créé UNE SEULE FOIS (dép. vide)
-  // Lit maxEnergyRef et exhaustedAtRef qui sont toujours à jour
-  // FIX #2 : lastTickRef n'est PLUS réinitialisé après la réponse API
-  // FIX #4 : maxEnergy lu depuis maxEnergyRef \u2014 pas capturé en closure
-  // FIX #1 : exhaustedAtRef modifié seulement ici (lecture) et dans handleTap/flushBatch (\u00e9criture)
+  // Timer regen — créé une seule fois, lit les refs
   // ----------------------------------------------------------------
   const lastTickRef = useRef<number>(Date.now());
 
@@ -157,27 +139,20 @@ export default function GamePage() {
       const elapsed = (now - lastTickRef.current) / 1000;
       lastTickRef.current = now;
 
-      const cur      = displayEnergyRef.current;
-      const maxE     = maxEnergyRef.current;
+      const cur  = displayEnergyRef.current;
+      const maxE = maxEnergyRef.current;
 
-      // Si énergie à 0 : vérifier le délai de 30s avant de regener
       if (cur <= 0) {
-        // exhaustedAtRef est set par handleTap ou par l'init
-        // Le timer ne le MODIFIE pas, il le LIT seulement
-        if (exhaustedAtRef.current === null) return; // pas encore enregistré, on attend
-        if (now - exhaustedAtRef.current < REGEN_DELAY_MS) return; // délai non écoulé
-        // Délai écoulé : on commence à régénérer depuis 0
+        if (exhaustedAtRef.current === null) return;
+        if (now - exhaustedAtRef.current < REGEN_DELAY_MS) return;
       }
 
-      // FIX #3 : si l'énergie vient d'être mise à jour par flushBatch (response.newEnergy),
-      // displayEnergyRef est déjà correct \u2014 on continue simplement la regen depuis là
       const newE = Math.min(maxE, cur + elapsed * REGEN_PER_SEC);
-      if (newE === cur) return; // rien à changer (max atteint ou epsilon)
+      if (newE === cur) return;
 
       displayEnergyRef.current = newE;
       setDisplayEnergy(newE);
 
-      // Sync store pour les autres pages
       useGameStore.setState((state) => {
         if (!state.user) return {};
         const updated = { ...state.user, energy: newE };
@@ -186,12 +161,12 @@ export default function GamePage() {
       });
     };
 
-    const id = setInterval(tick, 500); // 500ms pour une regen plus fluide visuellement
+    const id = setInterval(tick, 500);
     return () => clearInterval(id);
-  }, []); // FIX #4 : dép. vides \u2014 créé une seule fois, lit les refs
+  }, []);
 
   // ----------------------------------------------------------------
-  // flushBatch \u2014 ref stable, zéro stale closure
+  // flushBatch — envoie le batch + durationMs pour l’anti-triche
   // ----------------------------------------------------------------
   const flushBatchRef = useRef<() => Promise<void>>();
 
@@ -206,29 +181,31 @@ export default function GamePage() {
 
     const batchCount = tapPendingRef.current;
     if (batchCount === 0) return;
-    tapPendingRef.current = 0;
+    tapPendingRef.current  = 0;
+
+    // durationMs = temps écoulé depuis le premier tap du batch
+    const durationMs = batchStartTimeRef.current > 0
+      ? Date.now() - batchStartTimeRef.current
+      : undefined;
+    batchStartTimeRef.current = 0;
 
     const doFlush = async () => {
       try {
         const response = await apiRef.current.post<any>('/api/tap', {
-          count: batchCount,
-          clientTimestamp: new Date().toISOString(),
+          count           : batchCount,
+          clientTimestamp : new Date().toISOString(),
+          durationMs,
         });
 
-        // SOURCE DE VÉRITÉ : remplacement direct par les valeurs DB
+        // Source de vérité : valeurs directement issues du RETURNING DB
         displayBalanceRef.current = response.newBalance;
         displayTapsRef.current    = response.newTotalTaps;
         setDisplayBalance(response.newBalance);
         setDisplayTaps(response.newTotalTaps);
 
-        // FIX #2+#3 : on met à jour displayEnergyRef avec la valeur DB
-        // Le timer continuera la regen depuis cette valeur au prochain tick
-        // lastTickRef N'EST PAS réinitialisé \u2014 préserve la continuité temporelle
         displayEnergyRef.current = response.newEnergy;
         setDisplayEnergy(response.newEnergy);
 
-        // FIX #1 : si l'API dit que l'énergie est revenue > 0, on efface exhaustedAt
-        // Si l'énergie est 0, on s'assure qu'exhaustedAt est bien enregistré
         if (response.newEnergy > 0) {
           exhaustedAtRef.current = null;
         } else if (exhaustedAtRef.current === null) {
@@ -239,18 +216,17 @@ export default function GamePage() {
         if (latest) {
           const synced = {
             ...latest,
-            coin_balance : response.newBalance,
-            energy       : response.newEnergy,
-            total_taps   : response.newTotalTaps ?? latest.total_taps,
-            ai_level     : response.newAiLevel   ?? latest.ai_level,
+            coin_balance: response.newBalance,
+            energy      : response.newEnergy,
+            total_taps  : response.newTotalTaps ?? latest.total_taps,
+            ai_level    : response.newAiLevel   ?? latest.ai_level,
           };
           setUserRef.current(synced);
           userRef.current = synced;
         }
         if (response.aiLevelUp) hapticNotification('success');
       } catch {
-        // Erreur réseau : pas de rollback, la DB est sûre (UPDATE atomique)
-        // Au rechargement, le vrai solde sera affiché
+        // Pas de rollback : la DB est sûre (UPDATE atomique)
       } finally {
         batchInFlightRef.current = null;
       }
@@ -261,16 +237,12 @@ export default function GamePage() {
   };
 
   // ----------------------------------------------------------------
-  // handleTap \u2014 dép. vides, ne change jamais de référence
-  // FIX #1 : exhaustedAtRef SET ici (et nulle part ailleurs)
-  // FIX #5 : displayEnergyRef mis à jour atomiquement avant setDisplayEnergy
+  // handleTap
   // ----------------------------------------------------------------
   const handleTap = useCallback((e: React.MouseEvent | React.TouchEvent) => {
     if (e.type === 'click'      && Date.now() - lastTouchRef.current < 500) return;
     if (e.type === 'touchstart') lastTouchRef.current = Date.now();
 
-    // FIX #5 : lecture + écriture de la ref AVANT tout setState
-    // \u2014 si un autre tap arrive dans la même frame, il lit la valeur déjà décrémentée
     const energy = displayEnergyRef.current;
     if (energy < 1) { hapticNotification('error'); return; }
 
@@ -282,15 +254,17 @@ export default function GamePage() {
 
     const newEnergy  = Math.max(0, energy - 1);
     const newBalance = displayBalanceRef.current + 1;
-    const newTaps    = displayTapsRef.current + 1;
+    const newTaps    = displayTapsRef.current    + 1;
 
-    // FIX #1 : exhaustedAt SET ici, dans handleTap uniquement
-    // Le timer ne peut plus le remettre à null par erreur
     if (newEnergy === 0 && exhaustedAtRef.current === null) {
       exhaustedAtRef.current = Date.now();
     }
 
-    // Mise à jour atomique des refs D'ABORD, setState ensuite
+    // Marquer le début du batch pour durationMs
+    if (tapPendingRef.current === 0) {
+      batchStartTimeRef.current = Date.now();
+    }
+
     displayEnergyRef.current  = newEnergy;
     displayBalanceRef.current = newBalance;
     displayTapsRef.current    = newTaps;
