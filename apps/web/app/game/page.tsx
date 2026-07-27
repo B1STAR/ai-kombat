@@ -20,18 +20,18 @@ const REGEN_PER_SEC  = 1 / 3;
 
 function AiBadge({ level, type }: { level: number; type: string }) {
   const tiers = [
-    { min: 0,   max: 4,   label: 'Novice', color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '🧠' },
-    { min: 5,   max: 9,   label: 'Initié', color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '🐞' },
-    { min: 10,  max: 19,  label: 'Expert', color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '⚡' },
-    { min: 20,  max: 49,  label: 'Master', color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '🔮' },
-    { min: 50,  max: 99,  label: 'Legend', color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '👑' },
-    { min: 100, max: 999, label: 'GOD',    color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '🔥' },
+    { min: 0,   max: 4,   label: 'Novice', color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '\ud83e\udde0' },
+    { min: 5,   max: 9,   label: 'Initi\u00e9', color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '\ud83d\udc1e' },
+    { min: 10,  max: 19,  label: 'Expert', color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '\u26a1' },
+    { min: 20,  max: 49,  label: 'Master', color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '\ud83d\udd2e' },
+    { min: 50,  max: 99,  label: 'Legend', color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '\ud83d\udc51' },
+    { min: 100, max: 999, label: 'GOD',    color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '\ud83d\udd25' },
   ];
   const tier = tiers.find(t => level >= t.min && level <= t.max) || tiers[0];
   return (
     <div className="w-11 h-11 rounded-full flex flex-col items-center justify-center border-2 select-none"
       style={{ background: tier.bg, borderColor: tier.color }}
-      title={`AI ${tier.label} — Level ${level}`}>
+      title={`AI ${tier.label} \u2014 Level ${level}`}>
       <span style={{ fontSize: '16px', lineHeight: 1 }}>{tier.emoji}</span>
       <span style={{ fontSize: '8px', fontWeight: 700, color: tier.color, lineHeight: 1.2 }}>Lv.{level}</span>
     </div>
@@ -43,19 +43,26 @@ export default function GamePage() {
   const { isTelegram, initData, startParam, isReady } = useTelegram();
   const { user, setUser } = useGameStore();
 
-  // Refs stables pour éviter tout stale closure
-  const apiRef     = useRef(api);
-  const setUserRef = useRef(setUser);
-  const userRef    = useRef(user);
+  // Refs stables \u2014 aucune stale closure possible
+  const apiRef      = useRef(api);
+  const setUserRef  = useRef(setUser);
+  const userRef     = useRef(user);
   useEffect(() => { apiRef.current    = api;     }, [api]);
   useEffect(() => { setUserRef.current = setUser; }, [setUser]);
   useEffect(() => { userRef.current   = user;    }, [user]);
 
+  // FIX #4 : maxEnergy dans une ref pour que le timer le lise toujours à jour
+  // sans avoir besoin de recréer le setInterval
+  const maxEnergyRef = useRef<number>(1000);
+  useEffect(() => {
+    if (user?.max_energy) maxEnergyRef.current = user.max_energy;
+  }, [user?.max_energy]);
+
   // ----------------------------------------------------------------
-  // displayBalance : compteur VISUEL local, séparé du solde DB
-  // • Incrémenté instantanément à chaque tap pour l'UX
-  // • Remplacé par la vraie valeur DB dès que l'API répond
-  // • JAMAIS de rollback — l'API est l'unique source de vérité
+  // Compteurs VISUELS locaux \u2014 séparés du store DB
+  // \u2022 Tap        \u2192 incrément instantané (UX fluide)
+  // \u2022 Réponse API \u2192 remplacement direct par la vraie valeur DB
+  // \u2022 Jamais de rollback
   // ----------------------------------------------------------------
   const [displayBalance, setDisplayBalance] = useState<number>(0);
   const [displayTaps,    setDisplayTaps]    = useState<number>(0);
@@ -64,14 +71,14 @@ export default function GamePage() {
   const displayTapsRef    = useRef<number>(0);
   const displayEnergyRef  = useRef<number>(0);
 
-  // Sync display depuis le store (init + retour API)
+  // Sync display depuis le store uniquement quand aucun tap n'est en attente
   useEffect(() => {
     if (!user) return;
-    // On ne met à jour le display que si on n'est PAS en train de taper
-    // (tapPendingRef === 0 signifie qu'aucun tap n'est en attente)
     if (tapPendingRef.current === 0) {
       displayBalanceRef.current = user.coin_balance;
       displayTapsRef.current    = user.total_taps;
+      // FIX #5 : énergie syncée depuis le store seulement si pas de tap en cours
+      // pour éviter le conflit avec displayEnergyRef déjà mis à jour par le timer
       displayEnergyRef.current  = user.energy;
       setDisplayBalance(user.coin_balance);
       setDisplayTaps(user.total_taps);
@@ -82,10 +89,13 @@ export default function GamePage() {
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
 
   const lastTouchRef     = useRef<number>(0);
-  const tapPendingRef    = useRef(0);   // taps en attente d'envoi
+  const tapPendingRef    = useRef(0);
   const batchTimerRef    = useRef<NodeJS.Timeout>();
   const batchInFlightRef = useRef<Promise<void> | null>(null);
-  const exhaustedAtRef   = useRef<number | null>(null);
+
+  // FIX #1 : exhaustedAtRef géré UNIQUEMENT par handleTap et flushBatch
+  // Le timer ne le touche PLUS \u2014 évite le reset intempestif entre deux ticks
+  const exhaustedAtRef = useRef<number | null>(null);
 
   // ----------------------------------------------------------------
   // Init
@@ -99,13 +109,15 @@ export default function GamePage() {
         const response = await apiRef.current.post<{ user: any }>('/api/auth/init', { initData, referralCode });
         const u = response.user;
         setUserRef.current(u);
-        // Initialiser les compteurs display dès l'init
+        maxEnergyRef.current      = u.max_energy || 1000;
         displayBalanceRef.current = u.coin_balance;
         displayTapsRef.current    = u.total_taps;
         displayEnergyRef.current  = u.energy;
         setDisplayBalance(u.coin_balance);
         setDisplayTaps(u.total_taps);
         setDisplayEnergy(u.energy);
+        // Initialiser exhaustedAt si l'énergie est déjà à 0 au chargement
+        if (u.energy <= 0) exhaustedAtRef.current = Date.now();
       } catch {
         if (!isTelegram) {
           const devUser = {
@@ -117,6 +129,7 @@ export default function GamePage() {
             passiveIncomePerHour: 0,
           };
           setUserRef.current(devUser);
+          maxEnergyRef.current      = 1000;
           displayBalanceRef.current = 0;
           displayTapsRef.current    = 0;
           displayEnergyRef.current  = 1000;
@@ -130,34 +143,41 @@ export default function GamePage() {
   }, [isReady, initData]);
 
   // ----------------------------------------------------------------
-  // Regen locale — miroir de calculateValidEnergy() côté API
+  // Timer regen \u2014 créé UNE SEULE FOIS (dép. vide)
+  // Lit maxEnergyRef et exhaustedAtRef qui sont toujours à jour
+  // FIX #2 : lastTickRef n'est PLUS réinitialisé après la réponse API
+  // FIX #4 : maxEnergy lu depuis maxEnergyRef \u2014 pas capturé en closure
+  // FIX #1 : exhaustedAtRef modifié seulement ici (lecture) et dans handleTap/flushBatch (\u00e9criture)
   // ----------------------------------------------------------------
-  const lastTickRef    = useRef<number>(Date.now());
-  const energyTimerRef = useRef<NodeJS.Timeout>();
+  const lastTickRef = useRef<number>(Date.now());
 
   useEffect(() => {
-    if (!user) return;
-    const maxEnergy = user.max_energy || 1000;
-    lastTickRef.current = Date.now();
-
     const tick = () => {
       const now     = Date.now();
       const elapsed = (now - lastTickRef.current) / 1000;
       lastTickRef.current = now;
 
-      // Calcul de la nouvelle énergie
-      const cur = displayEnergyRef.current;
+      const cur      = displayEnergyRef.current;
+      const maxE     = maxEnergyRef.current;
+
+      // Si énergie à 0 : vérifier le délai de 30s avant de regener
       if (cur <= 0) {
-        if (exhaustedAtRef.current === null) exhaustedAtRef.current = now;
-        if (now - exhaustedAtRef.current < REGEN_DELAY_MS) return;
-      } else {
-        exhaustedAtRef.current = null;
+        // exhaustedAtRef est set par handleTap ou par l'init
+        // Le timer ne le MODIFIE pas, il le LIT seulement
+        if (exhaustedAtRef.current === null) return; // pas encore enregistré, on attend
+        if (now - exhaustedAtRef.current < REGEN_DELAY_MS) return; // délai non écoulé
+        // Délai écoulé : on commence à régénérer depuis 0
       }
-      const newE = Math.min(maxEnergy, cur + elapsed * REGEN_PER_SEC);
+
+      // FIX #3 : si l'énergie vient d'être mise à jour par flushBatch (response.newEnergy),
+      // displayEnergyRef est déjà correct \u2014 on continue simplement la regen depuis là
+      const newE = Math.min(maxE, cur + elapsed * REGEN_PER_SEC);
+      if (newE === cur) return; // rien à changer (max atteint ou epsilon)
+
       displayEnergyRef.current = newE;
       setDisplayEnergy(newE);
 
-      // Sync le store aussi pour que userRef reste cohérent
+      // Sync store pour les autres pages
       useGameStore.setState((state) => {
         if (!state.user) return {};
         const updated = { ...state.user, energy: newE };
@@ -166,18 +186,16 @@ export default function GamePage() {
       });
     };
 
-    energyTimerRef.current = setInterval(tick, 1000);
-    return () => clearInterval(energyTimerRef.current);
-  }, [user?.max_energy, user?.telegram_id]);
+    const id = setInterval(tick, 500); // 500ms pour une regen plus fluide visuellement
+    return () => clearInterval(id);
+  }, []); // FIX #4 : dép. vides \u2014 créé une seule fois, lit les refs
 
   // ----------------------------------------------------------------
-  // flushBatch — via ref stable, zéro stale closure
-  // Après réponse API : on remplace DIRECTEMENT le display par newBalance
+  // flushBatch \u2014 ref stable, zéro stale closure
   // ----------------------------------------------------------------
   const flushBatchRef = useRef<() => Promise<void>>();
 
   flushBatchRef.current = async () => {
-    // Attendre si un batch est déjà en vol
     if (batchInFlightRef.current) {
       await batchInFlightRef.current;
       if (tapPendingRef.current > 0) {
@@ -197,16 +215,26 @@ export default function GamePage() {
           clientTimestamp: new Date().toISOString(),
         });
 
-        // ✅ SOURCE DE VÉRITÉ : on remplace le display par la vraie valeur DB
+        // SOURCE DE VÉRITÉ : remplacement direct par les valeurs DB
         displayBalanceRef.current = response.newBalance;
         displayTapsRef.current    = response.newTotalTaps;
-        displayEnergyRef.current  = response.newEnergy;
         setDisplayBalance(response.newBalance);
         setDisplayTaps(response.newTotalTaps);
-        setDisplayEnergy(response.newEnergy);
-        if (response.newEnergy > 0) exhaustedAtRef.current = null;
 
-        // Sync le store (utilisé par les autres pages)
+        // FIX #2+#3 : on met à jour displayEnergyRef avec la valeur DB
+        // Le timer continuera la regen depuis cette valeur au prochain tick
+        // lastTickRef N'EST PAS réinitialisé \u2014 préserve la continuité temporelle
+        displayEnergyRef.current = response.newEnergy;
+        setDisplayEnergy(response.newEnergy);
+
+        // FIX #1 : si l'API dit que l'énergie est revenue > 0, on efface exhaustedAt
+        // Si l'énergie est 0, on s'assure qu'exhaustedAt est bien enregistré
+        if (response.newEnergy > 0) {
+          exhaustedAtRef.current = null;
+        } else if (exhaustedAtRef.current === null) {
+          exhaustedAtRef.current = Date.now();
+        }
+
         const latest = userRef.current;
         if (latest) {
           const synced = {
@@ -217,15 +245,12 @@ export default function GamePage() {
             ai_level     : response.newAiLevel   ?? latest.ai_level,
           };
           setUserRef.current(synced);
-          userRef.current    = synced;
-          lastTickRef.current = Date.now();
+          userRef.current = synced;
         }
         if (response.aiLevelUp) hapticNotification('success');
       } catch {
-        // En cas d'erreur réseau : on ne rollback PAS le display
-        // On laisse le solde visuel tel quel et on retentera au prochain batch
-        // Le vrai solde DB est sûr (UPDATE atomique côté API)
-        // Au pire, au rechargement de la page le vrai solde sera affiché
+        // Erreur réseau : pas de rollback, la DB est sûre (UPDATE atomique)
+        // Au rechargement, le vrai solde sera affiché
       } finally {
         batchInFlightRef.current = null;
       }
@@ -236,13 +261,16 @@ export default function GamePage() {
   };
 
   // ----------------------------------------------------------------
-  // handleTap — incrémente UNIQUEMENT les refs visuelles
-  // Aucune modification du store / userRef ici
+  // handleTap \u2014 dép. vides, ne change jamais de référence
+  // FIX #1 : exhaustedAtRef SET ici (et nulle part ailleurs)
+  // FIX #5 : displayEnergyRef mis à jour atomiquement avant setDisplayEnergy
   // ----------------------------------------------------------------
   const handleTap = useCallback((e: React.MouseEvent | React.TouchEvent) => {
-    if (e.type === 'click'     && Date.now() - lastTouchRef.current < 500) return;
+    if (e.type === 'click'      && Date.now() - lastTouchRef.current < 500) return;
     if (e.type === 'touchstart') lastTouchRef.current = Date.now();
 
+    // FIX #5 : lecture + écriture de la ref AVANT tout setState
+    // \u2014 si un autre tap arrive dans la même frame, il lit la valeur déjà décrémentée
     const energy = displayEnergyRef.current;
     if (energy < 1) { hapticNotification('error'); return; }
 
@@ -252,15 +280,17 @@ export default function GamePage() {
 
     hapticImpact('light');
 
-    // Mise à jour VISUELLE instantanée (refs + state)
     const newEnergy  = Math.max(0, energy - 1);
     const newBalance = displayBalanceRef.current + 1;
     const newTaps    = displayTapsRef.current + 1;
 
+    // FIX #1 : exhaustedAt SET ici, dans handleTap uniquement
+    // Le timer ne peut plus le remettre à null par erreur
     if (newEnergy === 0 && exhaustedAtRef.current === null) {
       exhaustedAtRef.current = Date.now();
     }
 
+    // Mise à jour atomique des refs D'ABORD, setState ensuite
     displayEnergyRef.current  = newEnergy;
     displayBalanceRef.current = newBalance;
     displayTapsRef.current    = newTaps;
@@ -268,16 +298,14 @@ export default function GamePage() {
     setDisplayBalance(newBalance);
     setDisplayTaps(newTaps);
 
-    // Floating coin
     const id = Date.now() + Math.random();
     setFloatingCoins(prev => [...prev, { id, x: clientX, y: clientY, amount: 1 }]);
     setTimeout(() => setFloatingCoins(prev => prev.filter(c => c.id !== id)), 1000);
 
-    // Accúmmulation du batch
     tapPendingRef.current += 1;
     clearTimeout(batchTimerRef.current);
     batchTimerRef.current = setTimeout(() => flushBatchRef.current?.(), 800);
-  }, []); // dépendances vides : ne change jamais de référence
+  }, []);
 
   // ----------------------------------------------------------------
   // Render
@@ -293,7 +321,7 @@ export default function GamePage() {
     );
   }
 
-  const maxEnergy   = user.max_energy || 1000;
+  const maxEnergy   = maxEnergyRef.current;
   const energyPct   = Math.min(100, (displayEnergy / maxEnergy) * 100);
   const energyColor =
     energyPct > 50 ? 'from-blue-600 to-violet-500'
@@ -301,7 +329,7 @@ export default function GamePage() {
     : 'from-red-700 to-red-500';
 
   const isExhausted = displayEnergy < 1;
-  const regenLabel  = isExhausted ? 'Recharge en cours…' : 'Tap to train';
+  const regenLabel  = isExhausted ? 'Recharge en cours\u2026' : 'Tap to train';
   const regenSub    = isExhausted ? '' : '+1 coin par tap';
 
   return (
@@ -332,11 +360,11 @@ export default function GamePage() {
         </button>
       </div>
 
-      {/* COINS — display depuis le compteur visuel local */}
+      {/* COINS */}
       <div className="flex justify-center items-center gap-3 pt-1 pb-3">
         <div className="w-10 h-10 rounded-full flex items-center justify-center"
           style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}>
-          <span className="text-lg">🪙</span>
+          <span className="text-lg">\ud83e\ude99</span>
         </div>
         <span className="text-4xl font-extrabold text-white tracking-tight">{fmt(displayBalance)}</span>
       </div>
@@ -358,11 +386,11 @@ export default function GamePage() {
         </svg>
       </div>
 
-      {/* ENERGIE + STATS — tout depuis les compteurs display */}
+      {/* ENERGIE + STATS */}
       <div className="px-4 mb-4">
         <div className="flex items-center justify-between mb-1.5">
           <div className="flex items-center gap-1.5">
-            <span className="text-sm">⚡</span>
+            <span className="text-sm">\u26a1</span>
             <span className="text-sm font-semibold text-white">{Math.floor(displayEnergy)}</span>
             <span className="text-xs text-slate-500">/ {maxEnergy}</span>
           </div>
@@ -371,12 +399,12 @@ export default function GamePage() {
         <div className="w-full h-2.5 rounded-full overflow-hidden mb-3"
           style={{ background: '#12141f', border: '1px solid #1e2030' }}>
           <motion.div className={`h-full bg-gradient-to-r ${energyColor} rounded-full`}
-            animate={{ width: `${energyPct}%` }} transition={{ duration: 0.3 }} />
+            animate={{ width: `${energyPct}%` }} transition={{ duration: 0.4 }} />
         </div>
         <div className="flex gap-2">
           {[
-            { label: 'Level IA',   value: String(user.ai_level),    color: 'text-violet-300' },
-            { label: 'Total taps', value: fmt(displayTaps),         color: 'text-white' },
+            { label: 'Level IA',   value: String(user.ai_level),       color: 'text-violet-300' },
+            { label: 'Total taps', value: fmt(displayTaps),            color: 'text-white' },
             { label: 'Referrals',  value: String(user.referral_count), color: 'text-green-400' },
           ].map(({ label, value, color }) => (
             <div key={label} className="flex-1 rounded-xl px-2 py-2 text-center"
