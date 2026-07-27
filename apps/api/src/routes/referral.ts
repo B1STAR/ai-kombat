@@ -38,7 +38,7 @@ referral.get('/list', authMiddleware, async (c) => {
       'referrals.bonus_paid_at',
     );
 
-  // Total des bonus d'invitation (500 coins immédiats)
+  // Total des bonus d'invitation
   const bonusRow = await db('transactions')
     .where({ user_id: user.id, type: 'referral_bonus' })
     .sum('amount as total')
@@ -50,12 +50,12 @@ referral.get('/list', authMiddleware, async (c) => {
     .sum('amount as total')
     .first();
 
-  // Commissions 10% cumulées par filleul
+  // Commissions 10% cumulées par filleul — FIX: db.raw pour JSON PostgreSQL
   const commissionsByReferree = await db('transactions')
     .where({ user_id: user.id, type: 'referral_commission' })
-    .select('metadata->referree_id as referree_id')
+    .select(db.raw("metadata->>'referree_id' as referree_id"))
     .sum('amount as total')
-    .groupBy('metadata->referree_id');
+    .groupBy(db.raw("metadata->>'referree_id'"));
 
   const commissionMap: Record<string, number> = {};
   for (const row of commissionsByReferree) {

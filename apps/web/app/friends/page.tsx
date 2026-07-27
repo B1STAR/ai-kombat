@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Users, Copy, Share2, Check, Coins, TrendingUp } from 'lucide-react';
+import { Users, Copy, Share2, Check } from 'lucide-react';
 import { useApi } from '@/lib/api';
 import { BottomNav } from '@/components/BottomNav';
 import { useTelegram } from '@/lib/telegram';
@@ -45,13 +45,14 @@ export default function FriendsPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    Promise.all([
-      api.get<ReferralInfo>('/api/referral/link'),
-      api.get<ReferralData>('/api/referral/list'),
-    ]).then(([ref, lst]) => {
-      setReferral(ref);
-      setData(lst);
-    }).catch(console.error)
+    // FIX: appels séparés pour éviter qu'une erreur sur /list cache le lien
+    api.get<ReferralInfo>('/api/referral/link')
+      .then((ref) => setReferral(ref))
+      .catch(console.error);
+
+    api.get<ReferralData>('/api/referral/list')
+      .then((lst) => setData(lst))
+      .catch(console.error)
       .finally(() => setLoading(false));
   }, []);
 
@@ -117,7 +118,7 @@ export default function FriendsPage() {
           className="flex items-center gap-2 bg-dark-800 rounded-lg px-3 py-2 mb-4 cursor-pointer hover:bg-dark-700 transition-colors"
         >
           <span className="text-xs text-accent-300 flex-1 truncate font-mono">
-            {referral?.link ?? '—'}
+            {referral?.link ?? '⏳ Loading...'}
           </span>
           {copied
             ? <Check className="w-4 h-4 text-green-400 shrink-0" />
@@ -125,12 +126,12 @@ export default function FriendsPage() {
         </div>
 
         <div className="flex gap-2">
-          <button onClick={copyLink} className="btn-secondary flex-1">
+          <button onClick={copyLink} disabled={!referral} className="btn-secondary flex-1 disabled:opacity-40">
             {copied
               ? <><Check className="w-4 h-4 inline mr-1" />Copied!</>
               : <><Copy className="w-4 h-4 inline mr-1" />Copy link</>}
           </button>
-          <button onClick={shareLink} className="btn-primary flex-1">
+          <button onClick={shareLink} disabled={!referral} className="btn-primary flex-1 disabled:opacity-40">
             <Share2 className="w-4 h-4 inline mr-1" />Share
           </button>
         </div>
