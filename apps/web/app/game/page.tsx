@@ -20,18 +20,18 @@ const REGEN_PER_SEC  = 1 / 3;
 
 function AiBadge({ level, type }: { level: number; type: string }) {
   const tiers = [
-    { min: 0,   max: 4,   label: 'Novice', color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '\ud83e\udde0' },
-    { min: 5,   max: 9,   label: 'Initi\u00e9', color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '\ud83d\udc1e' },
-    { min: 10,  max: 19,  label: 'Expert', color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '\u26a1' },
-    { min: 20,  max: 49,  label: 'Master', color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '\ud83d\udd2e' },
-    { min: 50,  max: 99,  label: 'Legend', color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '\ud83d\udc51' },
-    { min: 100, max: 999, label: 'GOD',    color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '\ud83d\udd25' },
+    { min: 0,   max: 4,   label: 'Novice',  color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '🧠' },
+    { min: 5,   max: 9,   label: 'Initié',  color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '🐞' },
+    { min: 10,  max: 19,  label: 'Expert',  color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '⚡' },
+    { min: 20,  max: 49,  label: 'Master',  color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '🔮' },
+    { min: 50,  max: 99,  label: 'Legend',  color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '👑' },
+    { min: 100, max: 999, label: 'GOD',     color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '🔥' },
   ];
   const tier = tiers.find(t => level >= t.min && level <= t.max) || tiers[0];
   return (
     <div className="w-11 h-11 rounded-full flex flex-col items-center justify-center border-2 select-none"
       style={{ background: tier.bg, borderColor: tier.color }}
-      title={`AI ${tier.label} \u2014 Level ${level}`}>
+      title={`AI ${tier.label} — Level ${level}`}>
       <span style={{ fontSize: '16px', lineHeight: 1 }}>{tier.emoji}</span>
       <span style={{ fontSize: '8px', fontWeight: 700, color: tier.color, lineHeight: 1.2 }}>Lv.{level}</span>
     </div>
@@ -46,9 +46,9 @@ export default function GamePage() {
   const apiRef     = useRef(api);
   const setUserRef = useRef(setUser);
   const userRef    = useRef(user);
-  useEffect(() => { apiRef.current    = api;     }, [api]);
+  useEffect(() => { apiRef.current     = api;     }, [api]);
   useEffect(() => { setUserRef.current = setUser; }, [setUser]);
-  useEffect(() => { userRef.current   = user;    }, [user]);
+  useEffect(() => { userRef.current    = user;    }, [user]);
 
   const maxEnergyRef = useRef<number>(1000);
   useEffect(() => { if (user?.max_energy) maxEnergyRef.current = user.max_energy; }, [user?.max_energy]);
@@ -61,17 +61,23 @@ export default function GamePage() {
   const displayTapsRef    = useRef<number>(0);
   const displayEnergyRef  = useRef<number>(0);
 
+  // Sync depuis le store uniquement quand aucun tap n'est en vol
+  // et que la valeur DB diffère significativement du display local
   useEffect(() => {
     if (!user) return;
-    if (tapPendingRef.current === 0) {
+    if (tapPendingRef.current === 0 && batchInFlightRef.current === null) {
       displayBalanceRef.current = user.coin_balance;
       displayTapsRef.current    = user.total_taps;
-      displayEnergyRef.current  = user.energy;
       setDisplayBalance(user.coin_balance);
       setDisplayTaps(user.total_taps);
-      setDisplayEnergy(user.energy);
+      // Énergie : sync depuis store seulement si pas en regen locale active
+      // (évite d'écraser une regen en cours par une vieille valeur du store)
+      if (exhaustedAtRef.current === null) {
+        displayEnergyRef.current = user.energy;
+        setDisplayEnergy(user.energy);
+      }
     }
-  }, [user?.coin_balance, user?.total_taps]);
+  }, [user?.coin_balance, user?.total_taps, user?.energy]);
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
 
@@ -81,7 +87,7 @@ export default function GamePage() {
   const batchInFlightRef = useRef<Promise<void> | null>(null);
   const exhaustedAtRef   = useRef<number | null>(null);
 
-  // durationMs : on mesure la durée réelle du batch pour l’anti-triche
+  // durationMs : mesure la durée réelle du batch pour l'anti-triche
   const batchStartTimeRef = useRef<number>(0);
 
   // ----------------------------------------------------------------
@@ -103,7 +109,12 @@ export default function GamePage() {
         setDisplayBalance(u.coin_balance);
         setDisplayTaps(u.total_taps);
         setDisplayEnergy(u.energy);
-        if (u.energy <= 0) exhaustedAtRef.current = Date.now();
+        // Si l'énergie arrive déjà à 0 depuis le serveur, on arme exhaustedAtRef
+        if (u.energy <= 0) {
+          exhaustedAtRef.current = Date.now();
+        } else {
+          exhaustedAtRef.current = null;
+        }
       } catch {
         if (!isTelegram) {
           const devUser = {
@@ -122,6 +133,7 @@ export default function GamePage() {
           setDisplayBalance(0);
           setDisplayTaps(0);
           setDisplayEnergy(1000);
+          exhaustedAtRef.current = null;
         }
       }
     };
@@ -143,15 +155,29 @@ export default function GamePage() {
       const maxE = maxEnergyRef.current;
 
       if (cur <= 0) {
+        // Pas encore épuisé côté ref → rien à faire
         if (exhaustedAtRef.current === null) return;
+        // Délai de 30s avant que la regen commence
         if (now - exhaustedAtRef.current < REGEN_DELAY_MS) return;
       }
+
+      if (cur >= maxE) return;
 
       const newE = Math.min(maxE, cur + elapsed * REGEN_PER_SEC);
       if (newE === cur) return;
 
       displayEnergyRef.current = newE;
       setDisplayEnergy(newE);
+
+      // FIX #1 — CRITIQUE : dès que l'énergie remonte à >= 1,
+      // on efface exhaustedAtRef. C'est le timer qui pilote la regen
+      // locale → c'est lui qui doit signaler la fin de l'épuisement.
+      // Sans ce reset, l'API continue de voir energy_exhausted_at set
+      // côté DB et retourne newEnergy=0 ou ~1 à chaque batch
+      // → frontend a crédité N coins, API n'en écrit que 1 → désync.
+      if (Math.floor(newE) >= 1 && exhaustedAtRef.current !== null) {
+        exhaustedAtRef.current = null;
+      }
 
       useGameStore.setState((state) => {
         if (!state.user) return {};
@@ -166,7 +192,7 @@ export default function GamePage() {
   }, []);
 
   // ----------------------------------------------------------------
-  // flushBatch — envoie le batch + durationMs pour l’anti-triche
+  // flushBatch — envoie le batch + durationMs pour l'anti-triche
   // ----------------------------------------------------------------
   const flushBatchRef = useRef<() => Promise<void>>();
 
@@ -181,7 +207,7 @@ export default function GamePage() {
 
     const batchCount = tapPendingRef.current;
     if (batchCount === 0) return;
-    tapPendingRef.current  = 0;
+    tapPendingRef.current = 0;
 
     // durationMs = temps écoulé depuis le premier tap du batch
     const durationMs = batchStartTimeRef.current > 0
@@ -203,13 +229,23 @@ export default function GamePage() {
         setDisplayBalance(response.newBalance);
         setDisplayTaps(response.newTotalTaps);
 
-        displayEnergyRef.current = response.newEnergy;
-        setDisplayEnergy(response.newEnergy);
-
+        // FIX #3 — double-sécurité sur exhaustedAtRef après réponse API
+        // Si l'API confirme que l'énergie est > 0, on s'assure que
+        // exhaustedAtRef est null (peut avoir été raté par le timer
+        // si le batch part exactement au moment du premier tick regen)
         if (response.newEnergy > 0) {
-          exhaustedAtRef.current = null;
-        } else if (exhaustedAtRef.current === null) {
-          exhaustedAtRef.current = Date.now();
+          if (exhaustedAtRef.current !== null) {
+            exhaustedAtRef.current = null;
+          }
+          displayEnergyRef.current = response.newEnergy;
+          setDisplayEnergy(response.newEnergy);
+        } else {
+          // newEnergy = 0 → épuisement confirmé par le serveur
+          displayEnergyRef.current = 0;
+          setDisplayEnergy(0);
+          if (exhaustedAtRef.current === null) {
+            exhaustedAtRef.current = Date.now();
+          }
         }
 
         const latest = userRef.current;
@@ -227,6 +263,7 @@ export default function GamePage() {
         if (response.aiLevelUp) hapticNotification('success');
       } catch {
         // Pas de rollback : la DB est sûre (UPDATE atomique)
+        // On remet tapPendingRef à 0 pour débloquer les prochains batchs
       } finally {
         batchInFlightRef.current = null;
       }
@@ -240,10 +277,13 @@ export default function GamePage() {
   // handleTap
   // ----------------------------------------------------------------
   const handleTap = useCallback((e: React.MouseEvent | React.TouchEvent) => {
-    if (e.type === 'click'      && Date.now() - lastTouchRef.current < 500) return;
-    if (e.type === 'touchstart') lastTouchRef.current = Date.now();
+    if (e.type === 'click'       && Date.now() - lastTouchRef.current < 500) return;
+    if (e.type === 'touchstart')   lastTouchRef.current = Date.now();
 
-    const energy = displayEnergyRef.current;
+    // FIX #2 — Math.floor pour éviter qu'un float 0.83 passe le guard
+    // pendant la regen (le bouton est disabled visuellement mais
+    // un tap rapide peut arriver avant que React re-render le disabled)
+    const energy = Math.floor(displayEnergyRef.current);
     if (energy < 1) { hapticNotification('error'); return; }
 
     let clientX = 0, clientY = 0;
@@ -252,11 +292,11 @@ export default function GamePage() {
 
     hapticImpact('light');
 
-    const newEnergy  = Math.max(0, energy - 1);
+    const newEnergy  = Math.max(0, displayEnergyRef.current - 1);
     const newBalance = displayBalanceRef.current + 1;
     const newTaps    = displayTapsRef.current    + 1;
 
-    if (newEnergy === 0 && exhaustedAtRef.current === null) {
+    if (Math.floor(newEnergy) === 0 && exhaustedAtRef.current === null) {
       exhaustedAtRef.current = Date.now();
     }
 
@@ -302,8 +342,8 @@ export default function GamePage() {
     : energyPct > 20 ? 'from-yellow-500 to-orange-500'
     : 'from-red-700 to-red-500';
 
-  const isExhausted = displayEnergy < 1;
-  const regenLabel  = isExhausted ? 'Recharge en cours\u2026' : 'Tap to train';
+  const isExhausted = Math.floor(displayEnergy) < 1;
+  const regenLabel  = isExhausted ? 'Recharge en cours…' : 'Tap to train';
   const regenSub    = isExhausted ? '' : '+1 coin par tap';
 
   return (
@@ -338,7 +378,7 @@ export default function GamePage() {
       <div className="flex justify-center items-center gap-3 pt-1 pb-3">
         <div className="w-10 h-10 rounded-full flex items-center justify-center"
           style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}>
-          <span className="text-lg">\ud83e\ude99</span>
+          <span className="text-lg">🪙</span>
         </div>
         <span className="text-4xl font-extrabold text-white tracking-tight">{fmt(displayBalance)}</span>
       </div>
@@ -350,10 +390,10 @@ export default function GamePage() {
           <path d="M0,24 Q195,0 390,24" fill="none" stroke="url(#goldArc)" strokeWidth="2" strokeLinecap="round" />
           <defs>
             <linearGradient id="goldArc" x1="0" y1="0" x2="1" y2="0">
-              <stop offset="0%" stopColor="transparent" />
-              <stop offset="25%" stopColor="#c9963a" />
-              <stop offset="50%" stopColor="#f0c060" />
-              <stop offset="75%" stopColor="#c9963a" />
+              <stop offset="0%"   stopColor="transparent" />
+              <stop offset="25%"  stopColor="#c9963a" />
+              <stop offset="50%"  stopColor="#f0c060" />
+              <stop offset="75%"  stopColor="#c9963a" />
               <stop offset="100%" stopColor="transparent" />
             </linearGradient>
           </defs>
@@ -364,7 +404,7 @@ export default function GamePage() {
       <div className="px-4 mb-4">
         <div className="flex items-center justify-between mb-1.5">
           <div className="flex items-center gap-1.5">
-            <span className="text-sm">\u26a1</span>
+            <span className="text-sm">⚡</span>
             <span className="text-sm font-semibold text-white">{Math.floor(displayEnergy)}</span>
             <span className="text-xs text-slate-500">/ {maxEnergy}</span>
           </div>
