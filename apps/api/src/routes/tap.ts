@@ -6,9 +6,11 @@
  * 2. calculateValidEnergy() appelé UNE SEULE FOIS, résultat réutilisé
  * 3. SELECT post-UPDATE supprimé : RETURNING retourne les valeurs exactes du UPDATE
  * 4. energy_exhausted_at géré correctement dans tous les cas
- * 5. [FIX CRITIQUE] last_energy_update N'EST PLUS touché lors d'un tap
- *    → seule la regen (passive) doit mettre à jour ce champ
- *    → sinon calculateValidEnergy repart de 0 à chaque batch et sous-estime l'énergie
+ * 5. last_energy_update N'EST PAS touché lors d'un tap
+ * 6. [FIX] Pendant la regen post-épuisement, energy en DB = 0 mais calculateValidEnergy
+ *    retourne une valeur positive. Le guard WHERE energy >= X comparait contre 0 → bloquait
+ *    toujours. Fix : on sync energy en DB AVANT le tap si on est en phase de regen,
+ *    puis on retire le guard (calculateValidEnergy est la source de vérité).
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -70,8 +72,10 @@ tap.post(
     if (!rawDbUser) return c.json({ error: 'User not found' }, 404);
     const dbUser = normalizeUser(rawDbUser);
 
-    // --- 1. ENERGIE : calculé une seule fois depuis l'état DB en cache middleware ---
+    // --- 1. ENERGIE : calculateValidEnergy est la source de vérité ---
+    // Elle tient compte de energy_exhausted_at + délai 30s + regen 0.333/s
     const currentEnergy = calculateValidEnergy(dbUser);
+
     if (currentEnergy < 1) {
       return c.json({
         error    : 'Insufficient energy',
@@ -80,7 +84,27 @@ tap.post(
       }, 400);
     }
 
-    // --- 2. ANTI-TRICHE ---
+    // --- 2. SYNC DB si regen post-épuisement en cours ---
+    // Problème : après épuisement, energy en DB = 0 mais calculateValidEnergy
+    // retourne > 0 (regen calculée). Si on laisse le guard WHERE energy >= X,
+    // il compare contre 0 → bloque toujours → désync frontend.
+    // Solution : si energy_exhausted_at est set et currentEnergy > 0,
+    // on écrit la valeur calculée en DB ET on efface energy_exhausted_at
+    // AVANT l'UPDATE du tap, dans la même transaction.
+    let syncedEnergy = currentEnergy;
+    if (dbUser.energy_exhausted_at && currentEnergy > 0) {
+      await db('users')
+        .where({ telegram_id: user.id })
+        .update({
+          energy             : currentEnergy,
+          energy_exhausted_at: null,
+          last_energy_update : new Date(),
+        });
+      // Recharger le user pour que le guard reflète la vraie valeur DB
+      syncedEnergy = currentEnergy;
+    }
+
+    // --- 3. ANTI-TRICHE ---
     const rawIp    = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
                   || c.req.header('x-real-ip')?.trim()
                   || null;
@@ -98,26 +122,22 @@ tap.post(
       return c.json({ error: 'Suspicious activity detected', reason }, 429);
     }
 
-    // --- 3. CALCUL ---
-    const energyToSpend = Math.min(count, currentEnergy);
+    // --- 4. CALCUL ---
+    const energyToSpend = Math.min(count, syncedEnergy);
     const passiveIncome = await getPassiveIncomePerHour(user.id);
     const multiplier    = 1 + Math.floor(passiveIncome / 1000) * 0.1;
     const coinsEarned   = Math.floor(energyToSpend * multiplier);
     const xpGained      = energyToSpend;
-    const newEnergy     = Math.max(0, currentEnergy - energyToSpend);
+    const newEnergy     = Math.max(0, syncedEnergy - energyToSpend);
     const isExhausted   = newEnergy === 0;
 
-    // --- 4. UPDATE ATOMIQUE + RETURNING ---
-    // [FIX CRITIQUE] last_energy_update N'EST PAS mis à jour ici.
-    // Ce champ doit rester à la valeur de la DERNIÈRE REGEN, pas du dernier tap.
-    // Si on l'écrase à chaque tap avec NOW(), calculateValidEnergy croira que la regen
-    // vient de démarrer → sous-estime l'énergie → le guard energy bloque → désync.
-    //
-    // last_energy_update est géré UNIQUEMENT par le système de regen passive
-    // (cron ou endpoint dédié), jamais ici.
+    // --- 5. UPDATE ATOMIQUE + RETURNING ---
+    // Le guard WHERE energy >= energyToSpend est maintenant fiable car
+    // on a synced energy en DB juste avant (étape 2) si nécessaire.
+    // last_energy_update n'est PAS touché ici (sauf si on vient de faire le sync
+    // post-épuisement à l'étape 2 où il est réinitialisé).
     const updatePayload: Record<string, any> = {
       energy             : newEnergy,
-      // last_energy_update : intentionnellement absent — voir commentaire ci-dessus
       total_taps         : db.raw('total_taps + ?',         [count]),
       coin_balance       : db.raw('coin_balance + ?',       [coinsEarned]),
       total_earned_coins : db.raw('total_earned_coins + ?', [coinsEarned]),
