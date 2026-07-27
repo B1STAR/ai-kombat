@@ -1,9 +1,8 @@
 /**
  * Tap routes: /api/tap
  *
- * FIX RACE CONDITION : UPDATE atomique WHERE energy >= energyToSpend.
- * FIX SUSPECT : si tap detecte suspect → 429 immediate, energie non consommee.
- * FIX EPUISEMENT : energy_exhausted_at geree dans user.service + cron.ts.
+ * FIX ATOMIQUE : energie + coins mis à jour dans UN SEUL UPDATE
+ * pour éliminer toute fenêtre de désynchronisation.
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -12,7 +11,7 @@ import { authMiddleware } from '../middlewares/auth';
 import { rateLimit } from '../middlewares/rateLimit';
 import { detectSuspiciousPattern, logTapEvent } from '../middlewares/antiCheat';
 import { db } from '../db/knex';
-import { addCoins, calculateValidEnergy, getUserByTelegramId, normalizeUser } from '../services/user.service';
+import { calculateValidEnergy, getUserByTelegramId, normalizeUser } from '../services/user.service';
 import { addXp, getPassiveIncomePerHour } from '../services/economy.service';
 import { logger } from '../lib/logger';
 
@@ -24,7 +23,7 @@ const tapSchema = z.object({
   durationMs: z.number().optional(),
 });
 
-/** Credite 10% des gains au parrain du filleul, sans bloquer le tap. */
+/** Crédite 10% des gains au parrain du filleul, sans bloquer le tap. */
 async function creditReferrerCommission(filleulId: number, coinsEarned: number): Promise<void> {
   if (coinsEarned <= 0) return;
   const commission = Math.floor(coinsEarned * 0.1);
@@ -74,12 +73,9 @@ tap.post(
       }, 400);
     }
 
-    // FIX: extract first IP from x-forwarded-for chain, fallback to null
-    // inet column does not accept arbitrary strings — null is safe (nullable column)
     const rawIp = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
                || c.req.header('x-real-ip')?.trim()
                || null;
-
     const userAgent = c.req.header('user-agent') || null;
     const { suspicious, reason } = await detectSuspiciousPattern(user.id, { count, clientTimestamp, durationMs });
 
@@ -92,30 +88,35 @@ tap.post(
 
     const energyToSpend = Math.min(count, currentEnergy);
     const passiveIncome = await getPassiveIncomePerHour(user.id);
-    const multiplier = 1 + Math.floor(passiveIncome / 1000) * 0.1;
-    const coinsEarned = Math.floor(energyToSpend * multiplier);
-    const xpGained = energyToSpend;
+    const multiplier   = 1 + Math.floor(passiveIncome / 1000) * 0.1;
+    const coinsEarned  = Math.floor(energyToSpend * multiplier);
+    const xpGained     = energyToSpend;
 
-    const newEnergy = Math.max(0, currentEnergy - energyToSpend);
-    const isExhausted = newEnergy === 0;
+    const newEnergy    = Math.max(0, currentEnergy - energyToSpend);
+    const isExhausted  = newEnergy === 0;
 
+    // FIX ATOMIQUE : energie + coins + total_taps + total_earned_coins
+    // mis à jour dans UN SEUL UPDATE — plus aucune fenêtre de désync possible
     const updatePayload: Record<string, any> = {
-      energy: newEnergy,
-      last_energy_update: new Date(),
-      total_taps: db.raw('total_taps + ?', [count]),
+      energy             : newEnergy,
+      last_energy_update : new Date(),
+      total_taps         : db.raw('total_taps + ?', [count]),
+      coin_balance       : db.raw('coin_balance + ?', [coinsEarned]),
+      total_earned_coins : db.raw('total_earned_coins + ?', [coinsEarned]),
     };
+
     if (isExhausted) {
       updatePayload.energy_exhausted_at = new Date();
     } else if (dbUser.energy_exhausted_at) {
       updatePayload.energy_exhausted_at = null;
     }
 
-    // UPDATE ATOMIQUE — race condition impossible
+    // UPDATE ATOMIQUE avec guard energy — race condition impossible
     const updatedRows = await db('users')
       .where({ telegram_id: user.id })
       .whereRaw('energy >= ?', [energyToSpend])
       .update(updatePayload)
-      .returning('energy');
+      .returning(['energy', 'coin_balance', 'total_taps']);
 
     if (!updatedRows || updatedRows.length === 0) {
       const fresh = await getUserByTelegramId(user.id);
@@ -126,8 +127,19 @@ tap.post(
       }, 400);
     }
 
-    await addCoins(user.id, coinsEarned, 'tap_earn');
-    creditReferrerCommission(user.id, coinsEarned).catch((err) =>
+    // Enregistrement transaction (non-bloquant pour la réponse)
+    db('transactions').insert({
+      user_id            : user.id,
+      type               : 'tap_earn',
+      currency           : 'coin',
+      amount             : coinsEarned,
+      balance_after      : Number(updatedRows[0].coin_balance),
+      related_entity_type: null,
+      related_entity_id  : null,
+    }).catch((err: any) => logger.error({ err, userId: user.id }, 'transaction insert failed'));
+
+    // Commission parrain (async, non-bloquant)
+    creditReferrerCommission(user.id, coinsEarned).catch((err: any) =>
       logger.error({ err, userId: user.id }, 'referrer commission async failed')
     );
 
@@ -138,13 +150,13 @@ tap.post(
     return c.json({
       coinsEarned,
       xpGained,
-      energySpent: energyToSpend,
-      newEnergy: Math.floor(Number(updated.energy)),
-      maxEnergy: updated.max_energy,
-      newBalance: updated.coin_balance,
-      newTotalTaps: updated.total_taps,
-      aiLevelUp: leveledUp,
-      newAiLevel: newLevel,
+      energySpent  : energyToSpend,
+      newEnergy    : Math.floor(Number(updated.energy)),
+      maxEnergy    : updated.max_energy,
+      newBalance   : updated.coin_balance,
+      newTotalTaps : updated.total_taps,
+      aiLevelUp    : leveledUp,
+      newAiLevel   : newLevel,
     });
   },
 );

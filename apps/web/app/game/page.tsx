@@ -15,7 +15,6 @@ interface FloatingCoin { id: number; x: number; y: number; amount: number; }
 
 const fmt = (n: number) => Math.floor(n).toLocaleString('fr-FR').replace(/\u202f/g, '\u00a0');
 
-// Délai de regen après épuisement total — doit correspondre à user.service.ts (30s)
 const REGEN_DELAY_MS = 30_000;
 const REGEN_PER_SEC  = 1 / 3;
 
@@ -47,16 +46,21 @@ export default function GamePage() {
   const userRef = useRef(user);
   useEffect(() => { userRef.current = user; }, [user]);
 
+  // On garde une ref stable vers api et setUser pour éviter les stale closures
+  const apiRef    = useRef(api);
+  const setUserRef = useRef(setUser);
+  useEffect(() => { apiRef.current = api; },       [api]);
+  useEffect(() => { setUserRef.current = setUser; }, [setUser]);
+
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
 
-  const lastTouchRef        = useRef<number>(0);
-  const tapPendingRef       = useRef(0);
-  // FIX coins rollback : on garde un compteur séparé par batch en vol
-  const optimisticRef       = useRef(0);   // coins optimistes du batch EN COURS (pas encore envoyé)
-  const batchTimerRef       = useRef<NodeJS.Timeout>();
-  const isBatchingRef       = useRef(false);
-  // FIX regen : timestamp de l'épuisement local pour bloquer la regen 30s
-  const exhaustedAtRef      = useRef<number | null>(null);
+  const lastTouchRef   = useRef<number>(0);
+  const tapPendingRef  = useRef(0);
+  const optimisticRef  = useRef(0);
+  const batchTimerRef  = useRef<NodeJS.Timeout>();
+  // FIX #1 : on utilise une ref de Promise pour attendre la fin du batch en vol
+  const batchInFlightRef = useRef<Promise<void> | null>(null);
+  const exhaustedAtRef = useRef<number | null>(null);
 
   // ----------------------------------------------------------------
   // Init
@@ -67,11 +71,11 @@ export default function GamePage() {
     const init = async () => {
       try {
         const referralCode = startParam.startsWith('ref_') ? startParam : undefined;
-        const response = await api.post<{ user: any }>('/api/auth/init', { initData, referralCode });
-        setUser(response.user);
+        const response = await apiRef.current.post<{ user: any }>('/api/auth/init', { initData, referralCode });
+        setUserRef.current(response.user);
       } catch (err: any) {
         if (!isTelegram) {
-          setUser({
+          setUserRef.current({
             id: 1, telegram_id: 123456, first_name: 'Dev', last_name: null,
             username: 'dev', photo_url: null, coin_balance: 0, gem_balance: 0,
             energy: 1000, max_energy: 1000, ai_name: 'My AI', ai_level: 0,
@@ -86,8 +90,7 @@ export default function GamePage() {
   }, [isReady, initData]);
 
   // ----------------------------------------------------------------
-  // Regen locale — miroir exact de calculateValidEnergy() côté API
-  // FIX : on bloque la regen 30s après épuisement total (energy === 0)
+  // Regen locale
   // ----------------------------------------------------------------
   const lastTickRef    = useRef<number>(Date.now());
   const energyTimerRef = useRef<NodeJS.Timeout>();
@@ -106,15 +109,10 @@ export default function GamePage() {
         if (!state.user) return {};
         const currentEnergy = Number(state.user.energy);
 
-        // FIX #1 regen : si énergie à 0, on attend REGEN_DELAY_MS avant de recharger
         if (currentEnergy <= 0) {
-          if (exhaustedAtRef.current === null) {
-            exhaustedAtRef.current = now;
-          }
-          const waited = now - exhaustedAtRef.current;
-          if (waited < REGEN_DELAY_MS) return {}; // encore en attente
+          if (exhaustedAtRef.current === null) exhaustedAtRef.current = now;
+          if (now - exhaustedAtRef.current < REGEN_DELAY_MS) return {};
         } else {
-          // L'énergie est revenue, on reset le compteur d'épuisement
           exhaustedAtRef.current = null;
         }
 
@@ -130,71 +128,78 @@ export default function GamePage() {
   }, [user?.max_energy, user?.telegram_id]);
 
   // ----------------------------------------------------------------
-  // flushBatch — envoi groupé vers l'API
-  // FIX coins : snapshot des coins optimistes AU MOMENT du flush
-  // pour que le rollback soit toujours précis même si de nouveaux taps arrivent
+  // flushBatch — FIX CRITIQUE : ref stable, pas de useCallback
+  // On attend la fin du batch en vol avant d'en envoyer un nouveau
   // ----------------------------------------------------------------
-  const flushBatch = useCallback(async () => {
-    if (isBatchingRef.current) {
-      clearTimeout(batchTimerRef.current);
-      batchTimerRef.current = setTimeout(flushBatch, 300);
+  const flushBatchRef = useRef<() => Promise<void>>();
+
+  flushBatchRef.current = async () => {
+    // FIX #1 : si un batch est déjà en vol, on attend qu'il finisse
+    // puis on replanifie — pas de stale closure possible
+    if (batchInFlightRef.current) {
+      await batchInFlightRef.current;
+      // Après l'attente, s'il reste des taps en attente, on les envoie
+      if (tapPendingRef.current > 0) {
+        batchTimerRef.current = setTimeout(() => flushBatchRef.current?.(), 50);
+      }
       return;
     }
 
-    const batchCount    = tapPendingRef.current;
-    // FIX : snapshot isolé des coins optimistes pour ce batch précis
+    const batchCount     = tapPendingRef.current;
     const batchOptimistic = optimisticRef.current;
     if (batchCount === 0) return;
 
-    tapPendingRef.current  = 0;
-    optimisticRef.current  = 0;   // reset — les prochains taps accumulent un nouveau compteur
-    isBatchingRef.current  = true;
+    tapPendingRef.current = 0;
+    optimisticRef.current = 0;
 
-    try {
-      const response = await api.post<any>('/api/tap', {
-        count: batchCount,
-        clientTimestamp: new Date().toISOString(),
-      });
+    const doFlush = async () => {
+      try {
+        const response = await apiRef.current.post<any>('/api/tap', {
+          count: batchCount,
+          clientTimestamp: new Date().toISOString(),
+        });
 
-      const latest = userRef.current;
-      if (latest) {
-        // FIX regen : si l'API dit que l'énergie est revenue, on reset l'épuisement local
-        if (response.newEnergy > 0) exhaustedAtRef.current = null;
-
-        const synced = {
-          ...latest,
-          coin_balance : response.newBalance,
-          energy       : response.newEnergy,
-          total_taps   : response.newTotalTaps ?? latest.total_taps,
-        };
-        setUser(synced);
-        userRef.current    = synced;
-        lastTickRef.current = Date.now();
+        const latest = userRef.current;
+        if (latest) {
+          if (response.newEnergy > 0) exhaustedAtRef.current = null;
+          const synced = {
+            ...latest,
+            coin_balance : response.newBalance,
+            energy       : response.newEnergy,
+            total_taps   : response.newTotalTaps ?? latest.total_taps,
+            ai_level     : response.newAiLevel   ?? latest.ai_level,
+          };
+          setUserRef.current(synced);
+          userRef.current    = synced;
+          lastTickRef.current = Date.now();
+        }
+        if (response.aiLevelUp) hapticNotification('success');
+      } catch {
+        // FIX #2 : rollback précis — uniquement les coins de CE batch
+        const latest = userRef.current;
+        if (latest) {
+          const reverted = {
+            ...latest,
+            coin_balance : Math.max(0, latest.coin_balance - batchOptimistic),
+            total_taps   : Math.max(0, latest.total_taps   - batchCount),
+          };
+          setUserRef.current(reverted);
+          userRef.current = reverted;
+        }
+      } finally {
+        batchInFlightRef.current = null;
       }
-      if (response.aiLevelUp) hapticNotification('success');
-    } catch {
-      // Rollback uniquement les coins de CE batch (batchOptimistic), pas ceux des taps suivants
-      const latest = userRef.current;
-      if (latest) {
-        const reverted = {
-          ...latest,
-          coin_balance : Math.max(0, latest.coin_balance - batchOptimistic),
-          total_taps   : Math.max(0, latest.total_taps   - batchCount),
-        };
-        setUser(reverted);
-        userRef.current = reverted;
-      }
-    } finally {
-      isBatchingRef.current = false;
-    }
-  }, [api, setUser]);
+    };
+
+    batchInFlightRef.current = doFlush();
+    await batchInFlightRef.current;
+  };
 
   // ----------------------------------------------------------------
-  // handleTap
+  // handleTap — stable grâce aux refs
   // ----------------------------------------------------------------
   const handleTap = useCallback((e: React.MouseEvent | React.TouchEvent) => {
-    // Anti double-fire touch + click
-    if (e.type === 'click'    && Date.now() - lastTouchRef.current < 500) return;
+    if (e.type === 'click'     && Date.now() - lastTouchRef.current < 500) return;
     if (e.type === 'touchstart') lastTouchRef.current = Date.now();
 
     const cu = userRef.current;
@@ -207,7 +212,6 @@ export default function GamePage() {
     hapticImpact('light');
 
     const newEnergy = Math.max(0, cu.energy - 1);
-    // FIX regen : si on vient d'atteindre 0, on enregistre le timestamp d'épuisement
     if (newEnergy === 0 && exhaustedAtRef.current === null) {
       exhaustedAtRef.current = Date.now();
     }
@@ -218,7 +222,7 @@ export default function GamePage() {
       energy       : newEnergy,
       total_taps   : cu.total_taps + 1,
     };
-    setUser(updated);
+    setUserRef.current(updated);
     userRef.current    = updated;
     optimisticRef.current += 1;
 
@@ -228,8 +232,9 @@ export default function GamePage() {
 
     tapPendingRef.current += 1;
     clearTimeout(batchTimerRef.current);
-    batchTimerRef.current = setTimeout(flushBatch, 600);
-  }, [flushBatch, setUser]);
+    // FIX #3 : délai 800ms pour laisser les taps rapides se regrouper
+    batchTimerRef.current = setTimeout(() => flushBatchRef.current?.(), 800);
+  }, []); // ← dépendances vides : handleTap ne change JAMAIS de référence
 
   if (!user) {
     return (
@@ -242,17 +247,16 @@ export default function GamePage() {
     );
   }
 
-  const maxEnergy    = user.max_energy || 1000;
-  const energyPct    = Math.min(100, (user.energy / maxEnergy) * 100);
-  const energyColor  =
+  const maxEnergy   = user.max_energy || 1000;
+  const energyPct   = Math.min(100, (user.energy / maxEnergy) * 100);
+  const energyColor =
     energyPct > 50 ? 'from-blue-600 to-violet-500'
     : energyPct > 20 ? 'from-yellow-500 to-orange-500'
     : 'from-red-700 to-red-500';
 
-  // FIX #3 : label de regen lisible — affiche le délai restant si épuisé
-  const isExhausted  = user.energy < 1;
-  const regenLabel   = isExhausted ? 'Recharge en cours…' : 'Tap to train';
-  const regenSub     = isExhausted ? '' : '+1 coin par tap';
+  const isExhausted = user.energy < 1;
+  const regenLabel  = isExhausted ? 'Recharge en cours…' : 'Tap to train';
+  const regenSub    = isExhausted ? '' : '+1 coin par tap';
 
   return (
     <div className="min-h-screen pb-20 flex flex-col" style={{ background: '#08090f' }}>
@@ -312,7 +316,6 @@ export default function GamePage() {
       <div className="px-4 mb-4">
         <div className="flex items-center justify-between mb-1.5">
           <div className="flex items-center gap-1.5">
-            {/* FIX #3 : emoji direct, pas d'escape unicode */}
             <span className="text-sm">⚡</span>
             <span className="text-sm font-semibold text-white">{Math.floor(user.energy)}</span>
             <span className="text-xs text-slate-500">/ {maxEnergy}</span>
