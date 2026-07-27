@@ -109,37 +109,57 @@ export const getUserByTelegramId = async (telegramId: number): Promise<User | nu
  * Calcule l'énergie actuelle en tenant compte de la regen progressive.
  *
  * RÈGLE FONDAMENTALE :
- * - last_energy_update est mis à jour UNIQUEMENT par la regen passive (cron/endpoint dédié).
- *   Il NE DOIT PAS être touché lors d'un tap (cf. tap.ts).
+ * - last_energy_update est mis à jour UNIQUEMENT par la regen passive (cron).
+ *   Il NE DOIT PAS être touché lors d'un tap.
  * - Conséquence : si energy_exhausted_at est null, la valeur `user.energy` en DB
- *   est déjà la valeur correcte (elle a été décrémentée atomiquement par le tap).
- *   On la retourne directement sans recalculer depuis last_energy_update.
+ *   est déjà la valeur correcte. On la retourne directement.
  *
- * COMPORTEMENT après épuisement :
- * - Si energy_exhausted_at est set → délai de 30 s avant que la regen commence.
+ * COMPORTEMENT après épuisement (energy_exhausted_at set) :
+ * - Délai 30 s avant que la regen commence.
  * - Regen : 1 point / 3 secondes (0.333/s).
+ * - IMPORTANT : la regen repart de `user.energy` (valeur en DB au moment de
+ *   l'épuisement, typiquement 0) et NON de 0 codé en dur.
+ *   Raison : si pour une raison quelconque energy_exhausted_at est set alors
+ *   que energy > 0 (ancienne donnée, race condition résolue tardivement),
+ *   on récupère correctement sans créer de désync.
+ *   Formule : floor( max(user.energy, 0) + elapsed * REGEN_PER_SECOND )
  */
 export const calculateValidEnergy = (user: User, now: Date = new Date()): number => {
   const REGEN_DELAY_AFTER_EXHAUSTION_MS = 30_000;
   const REGEN_PER_SECOND = 1 / 3;
 
-  // Cas normal (pas d'épuisement récent) :
-  // L'énergie en DB est déjà la valeur exacte — on la retourne telle quelle.
-  // Ne PAS recalculer depuis last_energy_update ici : ce champ n'est plus mis à jour
-  // lors des taps, donc il pointerait vers la dernière regen passive, pas le dernier tap.
+  const maxEnergy    = Number(user.max_energy);
+  const storedEnergy = Math.max(0, Math.floor(Number(user.energy)));
+
+  // ── Cas normal : pas d'épuisement en cours ──────────────────────────────
+  // L'énergie en DB est la source de vérité — on la retourne telle quelle.
+  // Ne PAS recalculer depuis last_energy_update : ce champ n'est plus mis à
+  // jour lors des taps, il pointerait vers la dernière regen passive.
   if (!user.energy_exhausted_at) {
-    return Math.min(Math.floor(Number(user.energy)), Number(user.max_energy));
+    return Math.min(storedEnergy, maxEnergy);
   }
 
-  // Cas épuisement : regen à partir de energy_exhausted_at + délai
-  const exhaustedAt   = new Date(user.energy_exhausted_at);
+  // ── Cas épuisement : energy_exhausted_at est set ─────────────────────────
+
+  // Sécurité : si l'énergie a déjà atteint le max (ex. regen cron déjà passée),
+  // on ne recalcule pas et on retourne directement.
+  if (storedEnergy >= maxEnergy) return maxEnergy;
+
+  const exhaustedAt    = new Date(user.energy_exhausted_at);
   const regenStartTime = new Date(exhaustedAt.getTime() + REGEN_DELAY_AFTER_EXHAUSTION_MS);
 
-  if (now < regenStartTime) return 0;
+  // Pas encore le délai de 30 s → énergie = valeur stockée (0 en général)
+  if (now < regenStartTime) return storedEnergy;
 
   const secondsPassed = Math.max(0, (now.getTime() - regenStartTime.getTime()) / 1000);
-  const newEnergy = secondsPassed * REGEN_PER_SECOND;
-  return Math.min(Math.floor(newEnergy), Number(user.max_energy));
+
+  // ── CORRECTION RACINE ──────────────────────────────────────────────────
+  // On repart de storedEnergy (valeur DB) et on ajoute la regen écoulée.
+  // Avant ce fix, on repartait de 0 : newEnergy = secondsPassed * REGEN_PER_SECOND
+  // → si user.energy était 2 en DB, on sous-estimait de 2 coins à chaque batch
+  // → tap.ts écrivait energy = calculé - count au lieu de DB - count → désync.
+  const newEnergy = storedEnergy + secondsPassed * REGEN_PER_SECOND;
+  return Math.min(Math.floor(newEnergy), maxEnergy);
 };
 
 export const addCoins = async (userId: number, amount: number, type: string, relatedEntity?: { type: string; id: number }): Promise<number> => {
@@ -163,7 +183,7 @@ export const addCoins = async (userId: number, amount: number, type: string, rel
 
 /**
  * spendCoins — UPDATE ATOMIQUE avec whereRaw coin_balance >= amount.
- * Evite le double-spend si deux requetes arrivent en meme temps.
+ * Evite le double-spend si deux requêtes arrivent en même temps.
  */
 export const spendCoins = async (userId: number, amount: number, type: string, relatedEntity?: { type: string; id: number }): Promise<number> => {
   const updated = await db<User>('users')
@@ -190,7 +210,7 @@ export const spendCoins = async (userId: number, amount: number, type: string, r
 };
 
 /**
- * getUserProgress — 3 requetes en PARALLELE via Promise.all.
+ * getUserProgress — 3 requêtes en PARALLÈLE via Promise.all.
  * Divise la latence par ~3 sur /api/auth/init.
  */
 export const getUserProgress = async (userId: number) => {
