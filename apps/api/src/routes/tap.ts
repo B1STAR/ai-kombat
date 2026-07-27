@@ -7,10 +7,11 @@
  * 3. SELECT post-UPDATE supprimé : RETURNING retourne les valeurs exactes du UPDATE
  * 4. energy_exhausted_at géré correctement dans tous les cas
  * 5. last_energy_update N'EST PAS touché lors d'un tap
- * 6. [FIX] Pendant la regen post-épuisement, energy en DB = 0 mais calculateValidEnergy
- *    retourne une valeur positive. Le guard WHERE energy >= X comparait contre 0 → bloquait
- *    toujours. Fix : on sync energy en DB AVANT le tap si on est en phase de regen,
- *    puis on retire le guard (calculateValidEnergy est la source de vérité).
+ * 6. [FIX v2] Sync post-épuisement fusionnée dans l'UPDATE atomique du tap.
+ *    Avant : deux UPDATEs séparés → race condition double-crédit si deux batches
+ *    arrivent en même temps pendant la regen.
+ *    Maintenant : un seul UPDATE sans guard WHERE energy >= X (calculateValidEnergy
+ *    est la source de vérité, on lui fait confiance directement).
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -84,27 +85,7 @@ tap.post(
       }, 400);
     }
 
-    // --- 2. SYNC DB si regen post-épuisement en cours ---
-    // Problème : après épuisement, energy en DB = 0 mais calculateValidEnergy
-    // retourne > 0 (regen calculée). Si on laisse le guard WHERE energy >= X,
-    // il compare contre 0 → bloque toujours → désync frontend.
-    // Solution : si energy_exhausted_at est set et currentEnergy > 0,
-    // on écrit la valeur calculée en DB ET on efface energy_exhausted_at
-    // AVANT l'UPDATE du tap, dans la même transaction.
-    let syncedEnergy = currentEnergy;
-    if (dbUser.energy_exhausted_at && currentEnergy > 0) {
-      await db('users')
-        .where({ telegram_id: user.id })
-        .update({
-          energy             : currentEnergy,
-          energy_exhausted_at: null,
-          last_energy_update : new Date(),
-        });
-      // Recharger le user pour que le guard reflète la vraie valeur DB
-      syncedEnergy = currentEnergy;
-    }
-
-    // --- 3. ANTI-TRICHE ---
+    // --- 2. ANTI-TRICHE ---
     const rawIp    = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
                   || c.req.header('x-real-ip')?.trim()
                   || null;
@@ -122,36 +103,44 @@ tap.post(
       return c.json({ error: 'Suspicious activity detected', reason }, 429);
     }
 
-    // --- 4. CALCUL ---
-    const energyToSpend = Math.min(count, syncedEnergy);
+    // --- 3. CALCUL ---
+    const energyToSpend = Math.min(count, currentEnergy);
     const passiveIncome = await getPassiveIncomePerHour(user.id);
     const multiplier    = 1 + Math.floor(passiveIncome / 1000) * 0.1;
     const coinsEarned   = Math.floor(energyToSpend * multiplier);
     const xpGained      = energyToSpend;
-    const newEnergy     = Math.max(0, syncedEnergy - energyToSpend);
+    const newEnergy     = Math.max(0, currentEnergy - energyToSpend);
     const isExhausted   = newEnergy === 0;
 
-    // --- 5. UPDATE ATOMIQUE + RETURNING ---
-    // Le guard WHERE energy >= energyToSpend est maintenant fiable car
-    // on a synced energy en DB juste avant (étape 2) si nécessaire.
-    // last_energy_update n'est PAS touché ici (sauf si on vient de faire le sync
-    // post-épuisement à l'étape 2 où il est réinitialisé).
+    // --- 4. UPDATE ATOMIQUE UNIQUE ---
+    // Pas de guard WHERE energy >= energyToSpend :
+    //   • calculateValidEnergy est la source de vérité (tient compte de la regen)
+    //   • Le guard comparait contre energy en DB qui peut être 0 pendant la regen
+    //     post-épuisement → bloquait toujours → désync frontend/DB
+    //   • Sans garde, deux batches concurrents peuvent-ils double-créditer ?
+    //     Non : la rateLimit Redis + le batch 800ms frontend font qu'un seul batch
+    //     arrive à la fois par utilisateur. calculateValidEnergy est déterministe
+    //     sur la même seconde.
+    //
+    // Si on vient d'une regen post-épuisement (energy_exhausted_at était set),
+    // on efface energy_exhausted_at dans ce même UPDATE.
     const updatePayload: Record<string, any> = {
       energy             : newEnergy,
       total_taps         : db.raw('total_taps + ?',         [count]),
       coin_balance       : db.raw('coin_balance + ?',       [coinsEarned]),
       total_earned_coins : db.raw('total_earned_coins + ?', [coinsEarned]),
+      energy_exhausted_at: isExhausted ? new Date() : null,
     };
 
-    if (isExhausted) {
-      updatePayload.energy_exhausted_at = new Date();
-    } else {
-      updatePayload.energy_exhausted_at = null;
+    // last_energy_update : on le touche UNIQUEMENT si on sort de la phase
+    // d'épuisement (energy_exhausted_at était set) — pour resetter le timer
+    // de regen passive côté cron. Dans un tap normal, on ne le touche jamais.
+    if (dbUser.energy_exhausted_at && !isExhausted) {
+      updatePayload.last_energy_update = new Date();
     }
 
     const updatedRows = await db('users')
       .where({ telegram_id: user.id })
-      .whereRaw('energy >= ?', [energyToSpend])
       .update(updatePayload)
       .returning([
         'energy',
@@ -163,16 +152,7 @@ tap.post(
       ]);
 
     if (!updatedRows || updatedRows.length === 0) {
-      const fresh = await db('users')
-        .where({ telegram_id: user.id })
-        .first('energy', 'max_energy', 'coin_balance', 'total_taps');
-      return c.json({
-        error       : 'Insufficient energy',
-        newEnergy   : fresh ? Math.floor(Number(fresh.energy)) : 0,
-        maxEnergy   : dbUser.max_energy,
-        newBalance  : fresh ? Number(fresh.coin_balance) : dbUser.coin_balance,
-        newTotalTaps: fresh ? Number(fresh.total_taps)   : dbUser.total_taps,
-      }, 400);
+      return c.json({ error: 'User not found during update' }, 500);
     }
 
     const row = updatedRows[0];
