@@ -106,27 +106,39 @@ export const getUserByTelegramId = async (telegramId: number): Promise<User | nu
 };
 
 /**
- * Calcule l'energie actuelle en tenant compte de la regen progressive.
- * - Si energy_exhausted_at est set, la regen ne commence QU'APRES 30s d'attente.
+ * Calcule l'énergie actuelle en tenant compte de la regen progressive.
+ *
+ * RÈGLE FONDAMENTALE :
+ * - last_energy_update est mis à jour UNIQUEMENT par la regen passive (cron/endpoint dédié).
+ *   Il NE DOIT PAS être touché lors d'un tap (cf. tap.ts).
+ * - Conséquence : si energy_exhausted_at est null, la valeur `user.energy` en DB
+ *   est déjà la valeur correcte (elle a été décrémentée atomiquement par le tap).
+ *   On la retourne directement sans recalculer depuis last_energy_update.
+ *
+ * COMPORTEMENT après épuisement :
+ * - Si energy_exhausted_at est set → délai de 30 s avant que la regen commence.
  * - Regen : 1 point / 3 secondes (0.333/s).
  */
 export const calculateValidEnergy = (user: User, now: Date = new Date()): number => {
   const REGEN_DELAY_AFTER_EXHAUSTION_MS = 30_000;
   const REGEN_PER_SECOND = 1 / 3;
 
-  let regenStartTime: Date;
-
-  if (user.energy_exhausted_at) {
-    const exhaustedAt = new Date(user.energy_exhausted_at);
-    regenStartTime = new Date(exhaustedAt.getTime() + REGEN_DELAY_AFTER_EXHAUSTION_MS);
-    if (now < regenStartTime) return 0;
-  } else {
-    regenStartTime = new Date(user.last_energy_update);
+  // Cas normal (pas d'épuisement récent) :
+  // L'énergie en DB est déjà la valeur exacte — on la retourne telle quelle.
+  // Ne PAS recalculer depuis last_energy_update ici : ce champ n'est plus mis à jour
+  // lors des taps, donc il pointerait vers la dernière regen passive, pas le dernier tap.
+  if (!user.energy_exhausted_at) {
+    return Math.min(Math.floor(Number(user.energy)), Number(user.max_energy));
   }
 
+  // Cas épuisement : regen à partir de energy_exhausted_at + délai
+  const exhaustedAt   = new Date(user.energy_exhausted_at);
+  const regenStartTime = new Date(exhaustedAt.getTime() + REGEN_DELAY_AFTER_EXHAUSTION_MS);
+
+  if (now < regenStartTime) return 0;
+
   const secondsPassed = Math.max(0, (now.getTime() - regenStartTime.getTime()) / 1000);
-  const baseEnergy = user.energy_exhausted_at ? 0 : Number(user.energy);
-  const newEnergy = baseEnergy + (secondsPassed * REGEN_PER_SECOND);
+  const newEnergy = secondsPassed * REGEN_PER_SECOND;
   return Math.min(Math.floor(newEnergy), Number(user.max_energy));
 };
 
@@ -182,19 +194,10 @@ export const spendCoins = async (userId: number, amount: number, type: string, r
  * Divise la latence par ~3 sur /api/auth/init.
  */
 export const getUserProgress = async (userId: number) => {
-  const [activeQuests, ownedModules, achievements] = await Promise.all([
-    db('user_quests')
-      .where({ user_id: userId, is_completed: false })
-      .join('quests', 'quests.id', 'user_quests.quest_id')
-      .select('user_quests.*', 'quests.name', 'quests.description', 'quests.reward_coins', 'quests.target_count'),
-    db('user_modules')
-      .where({ user_id: userId })
-      .join('ai_modules', 'ai_modules.id', 'user_modules.module_id')
-      .select('user_modules.*', 'ai_modules.code', 'ai_modules.name', 'ai_modules.coins_per_hour_bonus'),
-    db('user_achievements')
-      .where({ user_id: userId })
-      .join('achievements', 'achievements.id', 'user_achievements.achievement_id')
-      .select('user_achievements.*', 'achievements.name', 'achievements.icon_url'),
+  const [equipment, achievements, boosts] = await Promise.all([
+    db('user_equipment').where({ user_id: userId }),
+    db('user_achievements').where({ user_id: userId }),
+    db('user_boosts').where({ user_id: userId, active: true }),
   ]);
-  return { activeQuests, ownedModules, achievements };
+  return { equipment, achievements, boosts };
 };
