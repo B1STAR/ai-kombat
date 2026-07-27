@@ -15,11 +15,10 @@ interface FloatingCoin { id: number; x: number; y: number; amount: number; }
 
 const fmt = (n: number) => Math.floor(n).toLocaleString('fr-FR').replace(/\u202f/g, '\u00a0');
 
-/** Badge niveau IA — remplace l'avatar Telegram */
 function AiBadge({ level, type }: { level: number; type: string }) {
   const tiers = [
     { min: 0,   max: 4,   label: 'Novice', color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '\ud83e\udde0' },
-    { min: 5,   max: 9,   label: 'Initié', color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '\ud83d\udc1e' },
+    { min: 5,   max: 9,   label: 'Initi\u00e9', color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '\ud83d\udc1e' },
     { min: 10,  max: 19,  label: 'Expert', color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '\u26a1' },
     { min: 20,  max: 49,  label: 'Master', color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '\ud83d\udd2e' },
     { min: 50,  max: 99,  label: 'Legend', color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '\ud83d\udc51' },
@@ -29,7 +28,7 @@ function AiBadge({ level, type }: { level: number; type: string }) {
   return (
     <div className="w-11 h-11 rounded-full flex flex-col items-center justify-center border-2 select-none"
       style={{ background: tier.bg, borderColor: tier.color }}
-      title={`AI ${tier.label} — Level ${level}`}>
+      title={`AI ${tier.label} \u2014 Level ${level}`}>
       <span style={{ fontSize: '16px', lineHeight: 1 }}>{tier.emoji}</span>
       <span style={{ fontSize: '8px', fontWeight: 700, color: tier.color, lineHeight: 1.2 }}>Lv.{level}</span>
     </div>
@@ -51,9 +50,6 @@ export default function GamePage() {
   const tapBatchTimeoutRef = useRef<NodeJS.Timeout>();
   const optimisticAddedRef = useRef(0);
 
-  // ------------------------------------------------------------------
-  // Init : envoie startParam (referral) depuis le contexte Telegram
-  // ------------------------------------------------------------------
   useEffect(() => {
     if (!isReady) return;
     if (isTelegram && !initData) return;
@@ -78,40 +74,31 @@ export default function GamePage() {
     init();
   }, [isReady, initData]);
 
-  // ------------------------------------------------------------------
-  // Recharge énergie basée sur Date.now()
-  // Toutes les secondes : énergie = min(max, base + Δt * 1/3)
-  // ------------------------------------------------------------------
   const energyTimerRef = useRef<NodeJS.Timeout>();
   const lastTickRef = useRef<number>(Date.now());
 
   useEffect(() => {
     if (!user) return;
     const maxEnergy = user.max_energy || 1000;
-
     const tick = () => {
       const now = Date.now();
       const elapsed = (now - lastTickRef.current) / 1000;
       lastTickRef.current = now;
-
       const regen = elapsed * (1 / 3);
-
       useGameStore.setState((state) => {
         if (!state.user) return {};
         const newEnergy = Math.min(maxEnergy, Number(state.user.energy) + regen);
         return { user: { ...state.user, energy: newEnergy } };
       });
     };
-
     energyTimerRef.current = setInterval(tick, 1000);
     return () => clearInterval(energyTimerRef.current);
   }, [user?.max_energy, user?.telegram_id]);
 
-  // ------------------------------------------------------------------
-  // Tap handler
-  // ------------------------------------------------------------------
   const handleTap = (e: React.MouseEvent | React.TouchEvent) => {
-    if (!user || user.energy < 1) { hapticNotification('error'); return; }
+    // FIX: toujours lire userRef.current (valeur temps r\u00e9el) au lieu du snapshot React
+    const cu = userRef.current;
+    if (!cu || cu.energy < 1) { hapticNotification('error'); return; }
     if (isTapping) return;
     setIsTapping(true);
     clearTimeout(tapTimeoutRef.current);
@@ -122,9 +109,13 @@ export default function GamePage() {
     else if ('clientX' in e) { clientX = e.clientX; clientY = e.clientY; }
 
     hapticImpact('light');
-    // FIX: décrément optimiste de 1 (au lieu de 2.5) — cohérent avec le coût réel côté API
-    const newEnergy = Math.max(0, user.energy - 1);
-    setUser({ ...user, coin_balance: user.coin_balance + 1, energy: newEnergy, total_taps: user.total_taps + 1 });
+
+    // FIX: utiliser cu (userRef.current) pour \u00e9viter la race condition entre taps rapides
+    const newEnergy = Math.max(0, cu.energy - 1);
+    const updatedUser = { ...cu, coin_balance: cu.coin_balance + 1, energy: newEnergy, total_taps: cu.total_taps + 1 };
+    setUser(updatedUser);
+    // FIX: mettre \u00e0 jour userRef.current imm\u00e9diatement pour que le prochain tap parte de la bonne valeur
+    userRef.current = updatedUser;
     optimisticAddedRef.current += 1;
 
     const id = Date.now() + Math.random();
@@ -140,15 +131,21 @@ export default function GamePage() {
       optimisticAddedRef.current = 0;
       try {
         const response = await api.post<any>('/api/tap', { count: batchCount, clientTimestamp: new Date().toISOString() });
-        const cu = userRef.current;
-        if (cu) {
-          setUser({ ...cu, coin_balance: response.newBalance, energy: response.newEnergy, total_taps: response.newTotalTaps ?? cu.total_taps });
+        const latest = userRef.current;
+        if (latest) {
+          const synced = { ...latest, coin_balance: response.newBalance, energy: response.newEnergy, total_taps: response.newTotalTaps ?? latest.total_taps };
+          setUser(synced);
+          userRef.current = synced;
           lastTickRef.current = Date.now();
         }
         if (response.aiLevelUp) hapticNotification('success');
       } catch {
-        const cu = userRef.current;
-        if (cu) setUser({ ...cu, coin_balance: cu.coin_balance - optimisticCoins, total_taps: cu.total_taps - optimisticCoins });
+        const latest = userRef.current;
+        if (latest) {
+          const reverted = { ...latest, coin_balance: latest.coin_balance - optimisticCoins, total_taps: latest.total_taps - optimisticCoins };
+          setUser(reverted);
+          userRef.current = reverted;
+        }
       }
     }, 600);
   };
@@ -203,7 +200,7 @@ export default function GamePage() {
       <div className="flex justify-center items-center gap-3 pt-1 pb-3">
         <div className="w-10 h-10 rounded-full flex items-center justify-center"
           style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}>
-          <span className="text-lg">🪙</span>
+          <span className="text-lg">\ud83e\ude99</span>
         </div>
         <span className="text-4xl font-extrabold text-white tracking-tight">{fmt(user.coin_balance)}</span>
       </div>
@@ -229,7 +226,7 @@ export default function GamePage() {
       <div className="px-4 mb-4">
         <div className="flex items-center justify-between mb-1.5">
           <div className="flex items-center gap-1.5">
-            <span className="text-sm">⚡</span>
+            <span className="text-sm">\u26a1</span>
             <span className="text-sm font-semibold text-white">{Math.floor(user.energy)}</span>
             <span className="text-xs text-slate-500">/ {maxEnergy}</span>
           </div>
