@@ -20,18 +20,18 @@ const REGEN_PER_SEC  = 1 / 3;
 
 function AiBadge({ level, type }: { level: number; type: string }) {
   const tiers = [
-    { min: 0,   max: 4,   label: 'Novice',  color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '🧠' },
-    { min: 5,   max: 9,   label: 'Initié',  color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '🐞' },
-    { min: 10,  max: 19,  label: 'Expert',  color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '⚡' },
-    { min: 20,  max: 49,  label: 'Master',  color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '🔮' },
-    { min: 50,  max: 99,  label: 'Legend',  color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '👑' },
-    { min: 100, max: 999, label: 'GOD',     color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '🔥' },
+    { min: 0,   max: 4,   label: 'Novice',  color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '\u{1F9E0}' },
+    { min: 5,   max: 9,   label: 'Initi\u00e9',  color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '\u{1F41E}' },
+    { min: 10,  max: 19,  label: 'Expert',  color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '\u26A1' },
+    { min: 20,  max: 49,  label: 'Master',  color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '\u{1F52E}' },
+    { min: 50,  max: 99,  label: 'Legend',  color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '\u{1F451}' },
+    { min: 100, max: 999, label: 'GOD',     color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '\u{1F525}' },
   ];
   const tier = tiers.find(t => level >= t.min && level <= t.max) || tiers[0];
   return (
     <div className="w-11 h-11 rounded-full flex flex-col items-center justify-center border-2 select-none"
       style={{ background: tier.bg, borderColor: tier.color }}
-      title={`AI ${tier.label} — Level ${level}`}>
+      title={`AI ${tier.label} \u2014 Level ${level}`}>
       <span style={{ fontSize: '16px', lineHeight: 1 }}>{tier.emoji}</span>
       <span style={{ fontSize: '8px', fontWeight: 700, color: tier.color, lineHeight: 1.2 }}>Lv.{level}</span>
     </div>
@@ -53,7 +53,6 @@ export default function GamePage() {
   const maxEnergyRef = useRef<number>(1000);
   useEffect(() => { if (user?.max_energy) maxEnergyRef.current = user.max_energy; }, [user?.max_energy]);
 
-  // Compteurs visuels locaux — séparés du store DB
   const [displayBalance, setDisplayBalance] = useState<number>(0);
   const [displayTaps,    setDisplayTaps]    = useState<number>(0);
   const [displayEnergy,  setDisplayEnergy]  = useState<number>(0);
@@ -62,8 +61,7 @@ export default function GamePage() {
   const displayEnergyRef  = useRef<number>(0);
 
   // Sync balance/taps depuis le store uniquement quand aucun tap n'est en vol.
-  // L'énergie n'est PAS synchronisée ici — elle est gérée exclusivement
-  // par le timer tick() et par flushBatch après confirmation serveur.
+  // L'\u00e9nergie est g\u00e9r\u00e9e exclusivement par tick() et flushBatch.
   useEffect(() => {
     if (!user) return;
     if (tapPendingRef.current === 0 && batchInFlightRef.current === null) {
@@ -81,12 +79,17 @@ export default function GamePage() {
   const batchInFlightRef = useRef<Promise<void> | null>(null);
   const exhaustedAtRef   = useRef<number | null>(null);
   const batchStartTimeRef = useRef<number>(0);
-  // Timestamp du moment où le batch a été envoyé — pour corriger la regen
-  // accumulée pendant le vol réseau (Fix C)
-  const batchSentAtRef   = useRef<number>(0);
+  const batchSentAtRef    = useRef<number>(0);
 
   // ----------------------------------------------------------------
   // Init
+  // FIX RACINE : exhaustedAtRef ancr\u00e9 sur energy_exhausted_at DB.
+  // Avant : exhaustedAtRef = Date.now() si energy <= 0
+  //   \u2192 le d\u00e9lai 30s repartait de z\u00e9ro \u00e0 chaque reconnexion/changement de section.
+  // Apr\u00e8s : exhaustedAtRef = timestamp DB r\u00e9el
+  //   \u2192 le timer reprend exactement l\u00e0 o\u00f9 il en \u00e9tait.
+  // Pareil pour displayEnergyRef : on utilise calculateValidEnergy
+  //   c\u00f4t\u00e9 client pour reconstruire l'\u00e9nergie exacte au moment de la reconnexion.
   // ----------------------------------------------------------------
   useEffect(() => {
     if (!isReady) return;
@@ -100,11 +103,46 @@ export default function GamePage() {
         maxEnergyRef.current      = u.max_energy || 1000;
         displayBalanceRef.current = u.coin_balance;
         displayTapsRef.current    = u.total_taps;
-        displayEnergyRef.current  = u.energy;
         setDisplayBalance(u.coin_balance);
         setDisplayTaps(u.total_taps);
-        setDisplayEnergy(u.energy);
-        exhaustedAtRef.current = u.energy <= 0 ? Date.now() : null;
+
+        // --- Reconstruire l'\u00e9tat d'\u00e9nergie depuis les timestamps DB ---
+        // Le serveur retourne maintenant energy_exhausted_at dans le DTO.
+        // On recalcule l'\u00e9nergie c\u00f4t\u00e9 client exactement comme le serveur le ferait,
+        // ce qui garantit la continuit\u00e9 de la regen m\u00eame apr\u00e8s d\u00e9connexion.
+        if (u.energy_exhausted_at) {
+          // L'\u00e9nergie \u00e9tait \u00e9puis\u00e9e : on ancre exhaustedAtRef sur le vrai timestamp
+          exhaustedAtRef.current = new Date(u.energy_exhausted_at).getTime();
+
+          // Recalcul c\u00f4t\u00e9 client : est-ce que la regen a d\u00e9j\u00e0 commenc\u00e9 ?
+          const now            = Date.now();
+          const exhaustedAt    = exhaustedAtRef.current;
+          const regenStartAt   = exhaustedAt + REGEN_DELAY_MS;
+
+          if (now >= regenStartAt) {
+            // La regen est en cours : on calcule l'\u00e9nergie exacte
+            const secondsPassed = (now - regenStartAt) / 1000;
+            const regenedEnergy = Math.min(
+              u.max_energy,
+              Math.max(0, u.energy) + secondsPassed * REGEN_PER_SEC,
+            );
+            displayEnergyRef.current = regenedEnergy;
+            setDisplayEnergy(regenedEnergy);
+            // Si la regen est d\u00e9j\u00e0 compl\u00e8te, on lib\u00e8re exhaustedAtRef
+            if (Math.floor(regenedEnergy) >= u.max_energy) {
+              exhaustedAtRef.current = null;
+            }
+          } else {
+            // Encore dans le d\u00e9lai de 30s : \u00e9nergie = 0 (ou valeur DB)
+            displayEnergyRef.current = Math.max(0, u.energy);
+            setDisplayEnergy(Math.max(0, u.energy));
+          }
+        } else {
+          // Cas normal : pas d'\u00e9puisement en cours
+          exhaustedAtRef.current   = null;
+          displayEnergyRef.current = u.energy;
+          setDisplayEnergy(u.energy);
+        }
       } catch {
         if (!isTelegram) {
           const devUser = {
@@ -114,6 +152,7 @@ export default function GamePage() {
             ai_xp: 0, ai_type: 'novice', total_taps: 0, total_earned_coins: 0,
             referred_by: null, referral_count: 0, daily_streak: 0, is_banned: false,
             passiveIncomePerHour: 0,
+            energy_exhausted_at: null, last_energy_update: new Date().toISOString(),
           };
           setUserRef.current(devUser);
           maxEnergyRef.current      = 1000;
@@ -131,10 +170,8 @@ export default function GamePage() {
   }, [isReady, initData]);
 
   // ----------------------------------------------------------------
-  // Timer regen — créé une seule fois, lit UNIQUEMENT les refs display.
-  // FIX B : ne touche PLUS le store Zustand — supprime la race condition
-  // qui causait des re-renders en cascade via useEffect [coin_balance, total_taps].
-  // Le store est mis à jour exclusivement par flushBatch.
+  // Timer regen \u2014 cr\u00e9\u00e9 une seule fois, lit UNIQUEMENT les refs display.
+  // Ne touche PAS le store Zustand (Fix B).
   // ----------------------------------------------------------------
   const lastTickRef = useRef<number>(Date.now());
 
@@ -163,8 +200,6 @@ export default function GamePage() {
       if (Math.floor(newE) >= 1 && exhaustedAtRef.current !== null) {
         exhaustedAtRef.current = null;
       }
-      // FIX B : PAS de useGameStore.setState() ici.
-      // Le store n'est mis à jour que dans flushBatch.
     };
 
     const id = setInterval(tick, 500);
@@ -195,7 +230,6 @@ export default function GamePage() {
     batchStartTimeRef.current = 0;
 
     const doFlush = async () => {
-      // FIX C : on note l'heure d'envoi pour corriger la regen du vol réseau
       batchSentAtRef.current = Date.now();
       try {
         const response = await apiRef.current.post<any>('/api/tap', {
@@ -204,17 +238,14 @@ export default function GamePage() {
           durationMs,
         });
 
-        // FIX #2 : préserver les taps arrivés pendant le vol réseau
+        // Pr\u00e9server les taps arriv\u00e9s pendant le vol r\u00e9seau
         const pendingAfter = tapPendingRef.current;
         displayBalanceRef.current = response.newBalance   + pendingAfter;
         displayTapsRef.current    = response.newTotalTaps + pendingAfter;
         setDisplayBalance(response.newBalance   + pendingAfter);
         setDisplayTaps(response.newTotalTaps    + pendingAfter);
 
-        // FIX C : énergie ancrée sur le temps de vol réseau
-        // On ajoute la regen accumulée pendant la latence à dbEnergy
-        // avant toute comparaison avec le display local.
-        // Cela supprime le saut systématique post-batch.
+        // Energie post-flush ancr\u00e9e sur le temps de vol r\u00e9seau (Fix C)
         if (response.newEnergy <= 0) {
           displayEnergyRef.current = 0;
           setDisplayEnergy(0);
@@ -222,36 +253,26 @@ export default function GamePage() {
             exhaustedAtRef.current = Date.now();
           }
         } else {
-          const flightMs    = Date.now() - batchSentAtRef.current;
-          const regenFlight = (flightMs / 1000) * REGEN_PER_SEC;
-          // dbEnergy corrigé = ce que le serveur a retourné + regen accumulée pendant le vol
-          const dbEnergyAdjusted = Math.min(
-            maxEnergyRef.current,
-            response.newEnergy + regenFlight,
-          );
-
-          const localEnergy = displayEnergyRef.current;
-          const maxE        = maxEnergyRef.current;
-          // Tolérance adaptative : batchCount + marge de 5
-          const tolerance   = batchCount + 5;
+          const flightMs         = Date.now() - batchSentAtRef.current;
+          const regenFlight      = (flightMs / 1000) * REGEN_PER_SEC;
+          const dbEnergyAdjusted = Math.min(maxEnergyRef.current, response.newEnergy + regenFlight);
+          const localEnergy      = displayEnergyRef.current;
+          const maxE             = maxEnergyRef.current;
+          const tolerance        = batchCount + 5;
 
           if (localEnergy > dbEnergyAdjusted + tolerance) {
-            // Désync réelle : recalage sur la valeur DB corrigée
             displayEnergyRef.current = dbEnergyAdjusted;
             setDisplayEnergy(dbEnergyAdjusted);
           } else if (localEnergy < dbEnergyAdjusted) {
-            // DB (+ regen vol) confirme une énergie plus haute
             displayEnergyRef.current = Math.min(dbEnergyAdjusted, maxE);
             setDisplayEnergy(Math.min(dbEnergyAdjusted, maxE));
           }
-          // Dans la tolérance → on garde le display local (pas de saut)
 
           if (exhaustedAtRef.current !== null) {
             exhaustedAtRef.current = null;
           }
         }
 
-        // Sync store Zustand avec les valeurs DB confirmées
         const latest = userRef.current;
         if (latest) {
           const synced = {
@@ -266,7 +287,7 @@ export default function GamePage() {
         }
         if (response.aiLevelUp) hapticNotification('success');
       } catch {
-        // Pas de rollback : la DB est sûre (UPDATE atomique)
+        // Pas de rollback : la DB est s\u00fbre (UPDATE atomique)
       } finally {
         batchInFlightRef.current = null;
       }
@@ -277,14 +298,9 @@ export default function GamePage() {
   };
 
   // ----------------------------------------------------------------
-  // handleTap
-  // FIX A : onPointerDown remplace onClick + onTouchStart.
-  // Sur mobile React déclenche touchstart ET click (~300ms après).
-  // onPointerDown est déclenché une seule fois par interaction physique,
-  // sans doublon, sur tous les devices.
+  // handleTap \u2014 onPointerDown (Fix A : pas de doublon mobile)
   // ----------------------------------------------------------------
   const handleTap = useCallback((e: React.PointerEvent) => {
-    // Ignorer les pointer non-primaires (stylet secondaire, multi-touch parasite)
     if (e.isPrimary === false) return;
 
     const energy = Math.floor(displayEnergyRef.current);
@@ -342,7 +358,7 @@ export default function GamePage() {
     : 'from-red-700 to-red-500';
 
   const isExhausted = Math.floor(displayEnergy) < 1;
-  const regenLabel  = isExhausted ? 'Recharge en cours…' : 'Tap to train';
+  const regenLabel  = isExhausted ? 'Recharge en cours\u2026' : 'Tap to train';
   const regenSub    = isExhausted ? '' : '+1 coin par tap';
 
   return (
@@ -377,7 +393,7 @@ export default function GamePage() {
       <div className="flex justify-center items-center gap-3 pt-1 pb-3">
         <div className="w-10 h-10 rounded-full flex items-center justify-center"
           style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}>
-          <span className="text-lg">🪙</span>
+          <span className="text-lg">\u{1FA99}</span>
         </div>
         <span className="text-4xl font-extrabold text-white tracking-tight">{fmt(displayBalance)}</span>
       </div>
@@ -403,7 +419,7 @@ export default function GamePage() {
       <div className="px-4 mb-4">
         <div className="flex items-center justify-between mb-1.5">
           <div className="flex items-center gap-1.5">
-            <span className="text-sm">⚡</span>
+            <span className="text-sm">\u26A1</span>
             <span className="text-sm font-semibold text-white">{Math.floor(displayEnergy)}</span>
             <span className="text-xs text-slate-500">/ {maxEnergy}</span>
           </div>
@@ -430,7 +446,6 @@ export default function GamePage() {
       </div>
 
       {/* BOUTON TAP */}
-      {/* FIX A : onPointerDown remplace onClick+onTouchStart — pas de doublon sur mobile */}
       <div className="flex justify-center px-6">
         <motion.button
           onPointerDown={handleTap}

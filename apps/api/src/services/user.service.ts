@@ -36,10 +36,18 @@ export interface User {
   ban_reason: string | null;
 }
 
-/** Champs publics exposés au frontend — les champs internes sensibles sont filtrés */
+/**
+ * Champs publics exposés au frontend.
+ * energy_exhausted_at et last_energy_update sont inclus pour que le
+ * frontend puisse reconstruire l'état de regen exact après reconnexion,
+ * changement de section, ou redémarrage de l'app.
+ * Sans ces deux champs le timer client repart de Date.now() au lieu
+ * du vrai timestamp DB → délai de 30 s effacé + regen incorrecte.
+ */
 export type UserDTO = Pick<User,
   | 'id' | 'telegram_id' | 'first_name' | 'last_name' | 'username' | 'photo_url'
   | 'coin_balance' | 'gem_balance' | 'energy' | 'max_energy'
+  | 'energy_exhausted_at' | 'last_energy_update'
   | 'ai_name' | 'ai_level' | 'ai_xp' | 'ai_type'
   | 'total_taps' | 'total_earned_coins'
   | 'referred_by' | 'referral_count' | 'daily_streak' | 'is_premium'
@@ -56,6 +64,8 @@ export const toUserDTO = (user: User): UserDTO => ({
   gem_balance: user.gem_balance,
   energy: user.energy,
   max_energy: user.max_energy,
+  energy_exhausted_at: user.energy_exhausted_at,
+  last_energy_update: user.last_energy_update,
   ai_name: user.ai_name,
   ai_level: user.ai_level,
   ai_xp: user.ai_xp,
@@ -119,10 +129,6 @@ export const getUserByTelegramId = async (telegramId: number): Promise<User | nu
  * - Regen : 1 point / 3 secondes (0.333/s).
  * - IMPORTANT : la regen repart de `user.energy` (valeur en DB au moment de
  *   l'épuisement, typiquement 0) et NON de 0 codé en dur.
- *   Raison : si pour une raison quelconque energy_exhausted_at est set alors
- *   que energy > 0 (ancienne donnée, race condition résolue tardivement),
- *   on récupère correctement sans créer de désync.
- *   Formule : floor( max(user.energy, 0) + elapsed * REGEN_PER_SECOND )
  */
 export const calculateValidEnergy = (user: User, now: Date = new Date()): number => {
   const REGEN_DELAY_AFTER_EXHAUSTION_MS = 30_000;
@@ -131,33 +137,20 @@ export const calculateValidEnergy = (user: User, now: Date = new Date()): number
   const maxEnergy    = Number(user.max_energy);
   const storedEnergy = Math.max(0, Math.floor(Number(user.energy)));
 
-  // ── Cas normal : pas d'épuisement en cours ──────────────────────────────
-  // L'énergie en DB est la source de vérité — on la retourne telle quelle.
-  // Ne PAS recalculer depuis last_energy_update : ce champ n'est plus mis à
-  // jour lors des taps, il pointerait vers la dernière regen passive.
+  // Cas normal : pas d'épuisement en cours
   if (!user.energy_exhausted_at) {
     return Math.min(storedEnergy, maxEnergy);
   }
 
-  // ── Cas épuisement : energy_exhausted_at est set ─────────────────────────
-
-  // Sécurité : si l'énergie a déjà atteint le max (ex. regen cron déjà passée),
-  // on ne recalcule pas et on retourne directement.
+  // Sécurité : regen déjà terminée
   if (storedEnergy >= maxEnergy) return maxEnergy;
 
   const exhaustedAt    = new Date(user.energy_exhausted_at);
   const regenStartTime = new Date(exhaustedAt.getTime() + REGEN_DELAY_AFTER_EXHAUSTION_MS);
 
-  // Pas encore le délai de 30 s → énergie = valeur stockée (0 en général)
   if (now < regenStartTime) return storedEnergy;
 
   const secondsPassed = Math.max(0, (now.getTime() - regenStartTime.getTime()) / 1000);
-
-  // ── CORRECTION RACINE ──────────────────────────────────────────────────
-  // On repart de storedEnergy (valeur DB) et on ajoute la regen écoulée.
-  // Avant ce fix, on repartait de 0 : newEnergy = secondsPassed * REGEN_PER_SECOND
-  // → si user.energy était 2 en DB, on sous-estimait de 2 coins à chaque batch
-  // → tap.ts écrivait energy = calculé - count au lieu de DB - count → désync.
   const newEnergy = storedEnergy + secondsPassed * REGEN_PER_SECOND;
   return Math.min(Math.floor(newEnergy), maxEnergy);
 };
@@ -211,7 +204,6 @@ export const spendCoins = async (userId: number, amount: number, type: string, r
 
 /**
  * getUserProgress — 3 requêtes en PARALLÈLE via Promise.all.
- * Divise la latence par ~3 sur /api/auth/init.
  */
 export const getUserProgress = async (userId: number) => {
   const [equipment, achievements, boosts] = await Promise.all([
