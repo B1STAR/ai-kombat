@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Settings, TrendingUp, Brain } from 'lucide-react';
 import { useGameStore } from '@/lib/store';
@@ -40,16 +40,26 @@ export default function GamePage() {
   const { isTelegram, initData, startParam, isReady } = useTelegram();
   const { user, setUser } = useGameStore();
 
+  // ----------------------------------------------------------------
+  // userRef : source de verite temps reel — jamais de snapshot React
+  // ----------------------------------------------------------------
   const userRef = useRef(user);
   useEffect(() => { userRef.current = user; }, [user]);
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
-  const [isTapping, setIsTapping] = useState(false);
-  const tapTimeoutRef = useRef<NodeJS.Timeout>();
-  const tapPendingCountRef = useRef(0);
-  const tapBatchTimeoutRef = useRef<NodeJS.Timeout>();
-  const optimisticAddedRef = useRef(0);
 
+  // FIX #1 : suppression de isTapping/tapTimeoutRef — ils bloquaient les taps rapides
+  // Le guard contre le double-fire touch/click est géré par lastTouchRef ci-dessous
+  const lastTouchRef   = useRef<number>(0);      // FIX #2 : anti double-fire touch+click
+  const tapPendingRef  = useRef(0);              // taps en attente d'envoi
+  const optimisticRef  = useRef(0);              // coins optimistes non encore confirmés
+  const batchTimerRef  = useRef<NodeJS.Timeout>();
+  const isBatchingRef  = useRef(false);          // FIX #4 : guard batch concurrent
+  const pendingOnFlightRef = useRef(0);          // taps dans le batch en vol
+
+  // ----------------------------------------------------------------
+  // Init referral
+  // ----------------------------------------------------------------
   useEffect(() => {
     if (!isReady) return;
     if (isTelegram && !initData) return;
@@ -74,35 +84,112 @@ export default function GamePage() {
     init();
   }, [isReady, initData]);
 
-  const energyTimerRef = useRef<NodeJS.Timeout>();
+  // ----------------------------------------------------------------
+  // FIX #3 : Regen — on met à jour userRef.current EN MEME TEMPS que le store
+  // pour éviter la dérive entre le timer regen et les taps rapides
+  // ----------------------------------------------------------------
   const lastTickRef = useRef<number>(Date.now());
+  const energyTimerRef = useRef<NodeJS.Timeout>();
 
   useEffect(() => {
     if (!user) return;
     const maxEnergy = user.max_energy || 1000;
+    lastTickRef.current = Date.now();
+
     const tick = () => {
       const now = Date.now();
       const elapsed = (now - lastTickRef.current) / 1000;
       lastTickRef.current = now;
       const regen = elapsed * (1 / 3);
+
+      // Mettre à jour le store ET userRef en même temps
       useGameStore.setState((state) => {
         if (!state.user) return {};
         const newEnergy = Math.min(maxEnergy, Number(state.user.energy) + regen);
-        return { user: { ...state.user, energy: newEnergy } };
+        const updated = { ...state.user, energy: newEnergy };
+        // FIX #3 : synchroniser userRef avec la regen pour éviter la dérive
+        userRef.current = updated;
+        return { user: updated };
       });
     };
+
     energyTimerRef.current = setInterval(tick, 1000);
     return () => clearInterval(energyTimerRef.current);
   }, [user?.max_energy, user?.telegram_id]);
 
-  const handleTap = (e: React.MouseEvent | React.TouchEvent) => {
-    // FIX: toujours lire userRef.current (valeur temps r\u00e9el) au lieu du snapshot React
+  // ----------------------------------------------------------------
+  // FIX #4 : flush batch — attend la fin du batch en vol avant d'en envoyer un nouveau
+  // ----------------------------------------------------------------
+  const flushBatch = useCallback(async () => {
+    // Si un batch est déjà en vol, on reporte le flush
+    if (isBatchingRef.current) {
+      clearTimeout(batchTimerRef.current);
+      batchTimerRef.current = setTimeout(flushBatch, 300);
+      return;
+    }
+
+    const batchCount = tapPendingRef.current;
+    const optimisticCoins = optimisticRef.current;
+    if (batchCount === 0) return;
+
+    tapPendingRef.current = 0;
+    optimisticRef.current = 0;
+    pendingOnFlightRef.current = batchCount;
+    isBatchingRef.current = true;
+
+    try {
+      const response = await api.post<any>('/api/tap', {
+        count: batchCount,
+        clientTimestamp: new Date().toISOString(),
+      });
+
+      const latest = userRef.current;
+      if (latest) {
+        const synced = {
+          ...latest,
+          coin_balance: response.newBalance,
+          energy: response.newEnergy,
+          total_taps: response.newTotalTaps ?? latest.total_taps,
+        };
+        setUser(synced);
+        userRef.current = synced;
+        lastTickRef.current = Date.now();
+      }
+      if (response.aiLevelUp) hapticNotification('success');
+    } catch {
+      // Rollback optimiste uniquement sur les coins — énergie déjà correcte côté API
+      const latest = userRef.current;
+      if (latest) {
+        const reverted = {
+          ...latest,
+          coin_balance: Math.max(0, latest.coin_balance - optimisticCoins),
+          total_taps: Math.max(0, latest.total_taps - batchCount),
+        };
+        setUser(reverted);
+        userRef.current = reverted;
+      }
+    } finally {
+      isBatchingRef.current = false;
+      pendingOnFlightRef.current = 0;
+    }
+  }, [api, setUser]);
+
+  // ----------------------------------------------------------------
+  // handleTap — robuste, sans double-fire, sans snapshot React
+  // ----------------------------------------------------------------
+  const handleTap = useCallback((e: React.MouseEvent | React.TouchEvent) => {
+    // FIX #2 : supprimer le double-fire touch + click sur mobile
+    // onTouchStart déclenche aussi onClick ~300ms plus tard — on l'ignore
+    if (e.type === 'click') {
+      if (Date.now() - lastTouchRef.current < 500) return;
+    }
+    if (e.type === 'touchstart') {
+      lastTouchRef.current = Date.now();
+    }
+
+    // FIX #1 : plus de isTapping — on lit l'énergie réelle depuis userRef
     const cu = userRef.current;
     if (!cu || cu.energy < 1) { hapticNotification('error'); return; }
-    if (isTapping) return;
-    setIsTapping(true);
-    clearTimeout(tapTimeoutRef.current);
-    tapTimeoutRef.current = setTimeout(() => setIsTapping(false), 200);
 
     let clientX = 0, clientY = 0;
     if ('touches' in e && e.touches[0]) { clientX = e.touches[0].clientX; clientY = e.touches[0].clientY; }
@@ -110,45 +197,27 @@ export default function GamePage() {
 
     hapticImpact('light');
 
-    // FIX: utiliser cu (userRef.current) pour \u00e9viter la race condition entre taps rapides
+    // Mise à jour optimiste immédiate depuis userRef (jamais depuis le snapshot React)
     const newEnergy = Math.max(0, cu.energy - 1);
-    const updatedUser = { ...cu, coin_balance: cu.coin_balance + 1, energy: newEnergy, total_taps: cu.total_taps + 1 };
-    setUser(updatedUser);
-    // FIX: mettre \u00e0 jour userRef.current imm\u00e9diatement pour que le prochain tap parte de la bonne valeur
-    userRef.current = updatedUser;
-    optimisticAddedRef.current += 1;
+    const updated = {
+      ...cu,
+      coin_balance: cu.coin_balance + 1,
+      energy: newEnergy,
+      total_taps: cu.total_taps + 1,
+    };
+    setUser(updated);
+    userRef.current = updated;
+    optimisticRef.current += 1;
 
     const id = Date.now() + Math.random();
     setFloatingCoins((prev) => [...prev, { id, x: clientX, y: clientY, amount: 1 }]);
     setTimeout(() => setFloatingCoins((prev) => prev.filter((c) => c.id !== id)), 1000);
 
-    tapPendingCountRef.current += 1;
-    clearTimeout(tapBatchTimeoutRef.current);
-    tapBatchTimeoutRef.current = setTimeout(async () => {
-      const batchCount = tapPendingCountRef.current;
-      const optimisticCoins = optimisticAddedRef.current;
-      tapPendingCountRef.current = 0;
-      optimisticAddedRef.current = 0;
-      try {
-        const response = await api.post<any>('/api/tap', { count: batchCount, clientTimestamp: new Date().toISOString() });
-        const latest = userRef.current;
-        if (latest) {
-          const synced = { ...latest, coin_balance: response.newBalance, energy: response.newEnergy, total_taps: response.newTotalTaps ?? latest.total_taps };
-          setUser(synced);
-          userRef.current = synced;
-          lastTickRef.current = Date.now();
-        }
-        if (response.aiLevelUp) hapticNotification('success');
-      } catch {
-        const latest = userRef.current;
-        if (latest) {
-          const reverted = { ...latest, coin_balance: latest.coin_balance - optimisticCoins, total_taps: latest.total_taps - optimisticCoins };
-          setUser(reverted);
-          userRef.current = reverted;
-        }
-      }
-    }, 600);
-  };
+    // Accumule les taps et planifie le flush
+    tapPendingRef.current += 1;
+    clearTimeout(batchTimerRef.current);
+    batchTimerRef.current = setTimeout(flushBatch, 600);
+  }, [flushBatch, setUser]);
 
   if (!user) {
     return (
