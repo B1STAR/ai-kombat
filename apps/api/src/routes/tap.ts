@@ -1,21 +1,10 @@
 /**
  * Tap routes: /api/tap
  *
- * CORRECTIONS:
- * 1. Anti-triche analyse les TAPS individuels (durationMs), pas les batches
- * 2. calculateValidEnergy() appelé UNE SEULE FOIS, résultat réutilisé
- * 3. SELECT post-UPDATE supprimé : RETURNING retourne les valeurs exactes
- * 4. energy_exhausted_at géré correctement dans tous les cas
- * 5. last_energy_update N'EST PAS touché lors d'un tap
- * 6. [FIX v3] currentEnergy floored AVANT energyToSpend pour éviter
- *    qu'un float résiduel (ex. 0.7) passe le guard `>= 1` et crédite
- *    des coins alors que l'énergie entière est à 0.
- * 7. [FIX v3] energy_exhausted_at mis à null dans l'UPDATE quand !isExhausted
- *    — garantit la sortie propre du mode regen même si le frontend a raté
- *    le reset de son côté.
- * 8. [FIX v4] energy_exhausted_at reset à null si calculateValidEnergy()
- *    retourne >= max_energy pendant la regen, même si newEnergy post-tap > 0.
- *    Évite que energy_exhausted_at reste stale indéfiniment.
+ * ARCHITECTURE :
+ * Le serveur est la SOURCE DE VÉRITÉ unique pour energy_exhausted_at.
+ * La réponse JSON inclut toujours energyExhaustedAt (ISO string ou null).
+ * Le client n'a jamais à deviner ni maintenir cet état localement.
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -77,14 +66,15 @@ tap.post(
     if (!rawDbUser) return c.json({ error: 'User not found' }, 404);
     const dbUser = normalizeUser(rawDbUser);
 
-    // ── 1. ÉNERGIE : calculateValidEnergy est la source de vérité ───────────
+    // ── 1. ÉNERGIE ───────────────────────────────────────────────────────────
     const currentEnergy = Math.floor(calculateValidEnergy(dbUser));
 
     if (currentEnergy < 1) {
       return c.json({
-        error    : 'Insufficient energy',
-        newEnergy: 0,
-        maxEnergy: dbUser.max_energy,
+        error              : 'Insufficient energy',
+        newEnergy          : 0,
+        maxEnergy          : dbUser.max_energy,
+        energyExhaustedAt  : dbUser.energy_exhausted_at ?? null,
       }, 400);
     }
 
@@ -116,21 +106,16 @@ tap.post(
     const newEnergy   = Math.max(0, currentEnergy - energyToSpend);
     const isExhausted = newEnergy === 0;
 
-    // ── 4. UPDATE ATOMIQUE UNIQUE ────────────────────────────────────────────
+    // ── 4. UPDATE ATOMIQUE ───────────────────────────────────────────────────
     const updatePayload: Record<string, any> = {
       energy             : newEnergy,
       total_taps         : db.raw('total_taps + ?',         [count]),
       coin_balance       : db.raw('coin_balance + ?',       [coinsEarned]),
       total_earned_coins : db.raw('total_earned_coins + ?', [coinsEarned]),
-      // FIX v4 : on efface energy_exhausted_at dans 2 cas :
-      //   1. !isExhausted (comportement existant)
-      //   2. energy_exhausted_at était set ET calculateValidEnergy avait atteint
-      //      max_energy (regen complète) — évite un stale energy_exhausted_at
-      //      qui ferait recalculer une regen inutile au prochain tap.
       energy_exhausted_at: isExhausted ? new Date() : null,
     };
 
-    // last_energy_update : uniquement si on sort de la phase d'épuisement
+    // Mise à jour last_energy_update uniquement en sortie de regen
     if (dbUser.energy_exhausted_at && !isExhausted) {
       updatePayload.last_energy_update = new Date();
     }
@@ -169,19 +154,23 @@ tap.post(
       logger.error({ err, userId: user.id }, 'referrer commission async failed'),
     );
 
-    // XP (peut changer ai_level)
+    // XP
     const { leveledUp, newLevel } = await addXp(user.id, xpGained);
 
+    // ── 5. RÉPONSE : inclut toujours energyExhaustedAt ───────────────────────
+    // Le client utilise ce timestamp comme source de vérité pour la regen.
+    // null = énergie disponible. ISO string = épuisé, regen démarre 30s après.
     return c.json({
       coinsEarned,
       xpGained,
-      energySpent  : energyToSpend,
-      newEnergy    : newEnergy,
-      maxEnergy    : Number(row.max_energy),
-      newBalance   : Number(row.coin_balance),
-      newTotalTaps : Number(row.total_taps),
-      aiLevelUp    : leveledUp,
-      newAiLevel   : leveledUp ? newLevel : Number(row.ai_level),
+      energySpent      : energyToSpend,
+      newEnergy        : newEnergy,
+      maxEnergy        : Number(row.max_energy),
+      newBalance       : Number(row.coin_balance),
+      newTotalTaps     : Number(row.total_taps),
+      aiLevelUp        : leveledUp,
+      newAiLevel       : leveledUp ? newLevel : Number(row.ai_level),
+      energyExhaustedAt: row.energy_exhausted_at ? new Date(row.energy_exhausted_at).toISOString() : null,
     });
   },
 );

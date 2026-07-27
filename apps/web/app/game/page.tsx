@@ -45,10 +45,8 @@ export default function GamePage() {
 
   const apiRef     = useRef(api);
   const setUserRef = useRef(setUser);
-  const userRef    = useRef(user);
   useEffect(() => { apiRef.current     = api;     }, [api]);
   useEffect(() => { setUserRef.current = setUser; }, [setUser]);
-  useEffect(() => { userRef.current    = user;    }, [user]);
 
   const maxEnergyRef = useRef<number>(1000);
   useEffect(() => { if (user?.max_energy) maxEnergyRef.current = user.max_energy; }, [user?.max_energy]);
@@ -59,6 +57,19 @@ export default function GamePage() {
   const displayBalanceRef = useRef<number>(0);
   const displayTapsRef    = useRef<number>(0);
   const displayEnergyRef  = useRef<number>(0);
+
+  // SOURCE DE VÉRITÉ UNIQUE : timestamp d'épuisement reçu du serveur.
+  // null  = énergie disponible (ou regen terminée).
+  // number = ms epoch du moment où le serveur a confirmé l'épuisement.
+  // Ce ref n'est JAMAIS modifié localement par handleTap ou le tick.
+  // Il est UNIQUEMENT mis à jour par les réponses /api/tap et /api/auth/init.
+  const serverExhaustedAtRef = useRef<number | null>(null);
+
+  const tapPendingRef    = useRef(0);
+  const batchTimerRef    = useRef<NodeJS.Timeout>();
+  const batchInFlightRef = useRef<Promise<void> | null>(null);
+  const batchStartTimeRef = useRef<number>(0);
+  const batchSentAtRef    = useRef<number>(0);
 
   useEffect(() => {
     if (!user) return;
@@ -72,26 +83,56 @@ export default function GamePage() {
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
 
-  const tapPendingRef     = useRef(0);
-  const batchTimerRef     = useRef<NodeJS.Timeout>();
-  const batchInFlightRef  = useRef<Promise<void> | null>(null);
-  const exhaustedAtRef    = useRef<number | null>(null);
-  const batchStartTimeRef = useRef<number>(0);
-  const batchSentAtRef    = useRef<number>(0);
+  // ----------------------------------------------------------------
+  // Helpers : lire/écrire serverExhaustedAtRef + recalculer l'énergie
+  // depuis le timestamp serveur (utilisé à l'init et après chaque réponse).
+  // ----------------------------------------------------------------
+  const applyServerExhaustedAt = useCallback((isoOrNull: string | null) => {
+    if (!isoOrNull) {
+      serverExhaustedAtRef.current = null;
+      return;
+    }
+    const ms = new Date(isoOrNull).getTime();
+    serverExhaustedAtRef.current = ms;
+  }, []);
 
-  // ── exhaustedAtRef : source de vérité locale pour le mode épuisé ──────────
-  //
-  // Règle ABSOLUE :
-  //   exhaustedAtRef est SET   quand displayEnergyRef passe à 0.
-  //   exhaustedAtRef est CLEAR seulement si displayEnergyRef > 0 ET
-  //                            le serveur confirme newEnergy > 0.
-  //   Il ne doit JAMAIS être effacé par une réponse serveur
-  //   correspondant à un batch ANTÉRIEUR à l'épuisement.
-  //
-  // Le batchOriginEnergyRef mémorise la valeur de displayEnergyRef
-  // au moment où le batch est envoyé. Si cette valeur était > 0 mais
-  // que displayEnergyRef est maintenant à 0, on ne touche pas exhaustedAtRef.
-  const batchOriginEnergyRef = useRef<number>(0);
+  /**
+   * Recalcule l'énergie locale à partir du timestamp serveur et de l'énergie
+   * stockée en DB (base pour la regen). Appelé uniquement à l'init.
+   */
+  const rebuildEnergyFromServer = useCallback((u: any) => {
+    const maxE = u.max_energy || 1000;
+    maxEnergyRef.current = maxE;
+
+    if (!u.energy_exhausted_at) {
+      serverExhaustedAtRef.current = null;
+      displayEnergyRef.current     = Number(u.energy);
+      setDisplayEnergy(Number(u.energy));
+      return;
+    }
+
+    const exhaustedMs  = new Date(u.energy_exhausted_at).getTime();
+    serverExhaustedAtRef.current = exhaustedMs;
+
+    const now          = Date.now();
+    const regenStartAt = exhaustedMs + REGEN_DELAY_MS;
+
+    if (now < regenStartAt) {
+      // Délai pas encore passé
+      displayEnergyRef.current = 0;
+      setDisplayEnergy(0);
+      return;
+    }
+
+    const secondsPassed = (now - regenStartAt) / 1000;
+    const regenedEnergy = Math.min(maxE, Math.max(0, Number(u.energy)) + secondsPassed * REGEN_PER_SEC);
+    displayEnergyRef.current = regenedEnergy;
+    setDisplayEnergy(regenedEnergy);
+
+    if (Math.floor(regenedEnergy) >= maxE) {
+      serverExhaustedAtRef.current = null;
+    }
+  }, []);
 
   // ----------------------------------------------------------------
   // Init
@@ -105,35 +146,11 @@ export default function GamePage() {
         const response = await apiRef.current.post<{ user: any }>('/api/auth/init', { initData, referralCode });
         const u = response.user;
         setUserRef.current(u);
-        maxEnergyRef.current      = u.max_energy || 1000;
         displayBalanceRef.current = u.coin_balance;
         displayTapsRef.current    = u.total_taps;
         setDisplayBalance(u.coin_balance);
         setDisplayTaps(u.total_taps);
-
-        // Reconstruire l'état d'énergie depuis le timestamp DB
-        if (u.energy_exhausted_at) {
-          exhaustedAtRef.current = new Date(u.energy_exhausted_at).getTime();
-          const now          = Date.now();
-          const regenStartAt = exhaustedAtRef.current + REGEN_DELAY_MS;
-          if (now >= regenStartAt) {
-            const secondsPassed = (now - regenStartAt) / 1000;
-            const regenedEnergy = Math.min(
-              u.max_energy,
-              Math.max(0, u.energy) + secondsPassed * REGEN_PER_SEC,
-            );
-            displayEnergyRef.current = regenedEnergy;
-            setDisplayEnergy(regenedEnergy);
-            if (Math.floor(regenedEnergy) >= u.max_energy) exhaustedAtRef.current = null;
-          } else {
-            displayEnergyRef.current = Math.max(0, u.energy);
-            setDisplayEnergy(Math.max(0, u.energy));
-          }
-        } else {
-          exhaustedAtRef.current   = null;
-          displayEnergyRef.current = u.energy;
-          setDisplayEnergy(u.energy);
-        }
+        rebuildEnergyFromServer(u);
       } catch {
         if (!isTelegram) {
           const devUser = {
@@ -146,40 +163,42 @@ export default function GamePage() {
             energy_exhausted_at: null, last_energy_update: new Date().toISOString(),
           };
           setUserRef.current(devUser);
-          maxEnergyRef.current      = 1000;
           displayBalanceRef.current = 0;
           displayTapsRef.current    = 0;
-          displayEnergyRef.current  = 1000;
+          rebuildEnergyFromServer(devUser);
           setDisplayBalance(0);
           setDisplayTaps(0);
-          setDisplayEnergy(1000);
-          exhaustedAtRef.current = null;
         }
       }
     };
     init();
-  }, [isReady, initData]);
+  }, [isReady, initData, rebuildEnergyFromServer]);
 
   // ----------------------------------------------------------------
-  // Timer regen
+  // Timer regen — tic toutes les 500ms
+  // Repose UNIQUEMENT sur serverExhaustedAtRef (jamais modifié localement).
   // ----------------------------------------------------------------
   const lastTickRef = useRef<number>(Date.now());
 
   useEffect(() => {
     const tick = () => {
       const now     = Date.now();
-      const elapsed = (now - lastTickRef.current) / 1000;
+      // Cap elapsed à 2s pour éviter les sauts brutaux après retour d'arrière-plan
+      const elapsed = Math.min((now - lastTickRef.current) / 1000, 2);
       lastTickRef.current = now;
 
       const cur  = displayEnergyRef.current;
       const maxE = maxEnergyRef.current;
+      if (cur >= maxE) return;
+
+      const exhaustedAt = serverExhaustedAtRef.current;
 
       if (cur <= 0) {
-        if (exhaustedAtRef.current === null) return;
-        if (now - exhaustedAtRef.current < REGEN_DELAY_MS) return;
+        // Pas d'épuisement connu du serveur : on ne regen pas
+        if (exhaustedAt === null) return;
+        // Délai 30s pas encore passé
+        if (now - exhaustedAt < REGEN_DELAY_MS) return;
       }
-
-      if (cur >= maxE) return;
 
       const newE = Math.min(maxE, cur + elapsed * REGEN_PER_SEC);
       if (newE === cur) return;
@@ -187,8 +206,9 @@ export default function GamePage() {
       displayEnergyRef.current = newE;
       setDisplayEnergy(newE);
 
-      if (Math.floor(newE) >= 1 && exhaustedAtRef.current !== null) {
-        exhaustedAtRef.current = null;
+      // Regen terminée : efface le timestamp serveur localement
+      if (Math.floor(newE) >= maxE) {
+        serverExhaustedAtRef.current = null;
       }
     };
 
@@ -197,7 +217,7 @@ export default function GamePage() {
   }, []);
 
   // ----------------------------------------------------------------
-  // flushBatch
+  // flushBatch — logique simple, sans cas complexes
   // ----------------------------------------------------------------
   const flushBatchRef = useRef<() => Promise<void>>();
 
@@ -219,11 +239,6 @@ export default function GamePage() {
       : undefined;
     batchStartTimeRef.current = 0;
 
-    // Snapshot de l'énergie AU MOMENT de l'envoi
-    // Permet de détecter si l'épuisement est survenu PENDANT le vol réseau
-    const energyAtBatchSend = displayEnergyRef.current;
-    batchOriginEnergyRef.current = energyAtBatchSend;
-
     const doFlush = async () => {
       batchSentAtRef.current = Date.now();
       try {
@@ -233,67 +248,40 @@ export default function GamePage() {
           durationMs,
         });
 
+        // ── Sync balance & taps ──────────────────────────────────────────────
         const pendingAfter = tapPendingRef.current;
         displayBalanceRef.current = response.newBalance   + pendingAfter;
         displayTapsRef.current    = response.newTotalTaps + pendingAfter;
         setDisplayBalance(response.newBalance   + pendingAfter);
         setDisplayTaps(response.newTotalTaps    + pendingAfter);
 
-        // ── RÈGLE CRITIQUE : gestion de exhaustedAtRef après réponse serveur ──
-        //
-        // On ne touche exhaustedAtRef QUE si displayEnergyRef.current > 0
-        // au moment de la réponse. Si le display est à 0, l'épuisement a eu
-        // lieu PENDANT le vol réseau : la réponse concerne un batch
-        // antérieur à l'épuisement → on NE TOUCHE PAS exhaustedAtRef.
-        //
-        // Cas 1 : le serveur confirme l'épuisement (newEnergy <= 0)
+        // ── Sync énergie depuis le serveur (SOURCE DE VÉRITÉ) ────────────────
+        // On applique toujours energyExhaustedAt reçu du serveur.
+        applyServerExhaustedAt(response.energyExhaustedAt ?? null);
+
         if (response.newEnergy <= 0) {
+          // Épuisé : l'énergie locale passe à 0, le tick s'occupera de la regen
           displayEnergyRef.current = 0;
           setDisplayEnergy(0);
-          // Toujours setter exhaustedAtRef si pas déjà set
-          if (exhaustedAtRef.current === null) {
-            exhaustedAtRef.current = Date.now();
+        } else {
+          // Énergie disponible : on corrige l'affichage local si dérive trop large
+          const flightMs         = Date.now() - batchSentAtRef.current;
+          const regenFlight      = (flightMs / 1000) * REGEN_PER_SEC;
+          const serverEnergyAdj  = Math.min(maxEnergyRef.current, response.newEnergy + regenFlight);
+          const localEnergy      = displayEnergyRef.current;
+          const tolerance        = batchCount + 5;
+
+          if (localEnergy > serverEnergyAdj + tolerance || localEnergy < serverEnergyAdj) {
+            displayEnergyRef.current = serverEnergyAdj;
+            setDisplayEnergy(serverEnergyAdj);
           }
-          return; // rien d'autre à faire
-        }
-
-        // Cas 2 : le serveur dit newEnergy > 0
-        // Mais l'affichage local est déjà à 0 (épuisement survenu pendant vol)
-        // → NE PAS effacer exhaustedAtRef, NE PAS remonter l'énergie
-        if (Math.floor(displayEnergyRef.current) <= 0) {
-          // Le batch était en vol quand l'épuisement est survenu.
-          // On ignore la réponse énergie du serveur pour ce batch.
-          // exhaustedAtRef reste tel quel (déjà set par handleTap).
-          return;
-        }
-
-        // Cas 3 : tout va bien, on synchronise l'énergie normalement
-        const flightMs         = Date.now() - batchSentAtRef.current;
-        const regenFlight      = (flightMs / 1000) * REGEN_PER_SEC;
-        const dbEnergyAdjusted = Math.min(maxEnergyRef.current, response.newEnergy + regenFlight);
-        const localEnergy      = displayEnergyRef.current;
-        const maxE             = maxEnergyRef.current;
-        const tolerance        = batchCount + 5;
-
-        if (localEnergy > dbEnergyAdjusted + tolerance) {
-          displayEnergyRef.current = dbEnergyAdjusted;
-          setDisplayEnergy(dbEnergyAdjusted);
-        } else if (localEnergy < dbEnergyAdjusted) {
-          displayEnergyRef.current = Math.min(dbEnergyAdjusted, maxE);
-          setDisplayEnergy(Math.min(dbEnergyAdjusted, maxE));
-        }
-
-        // Ici displayEnergyRef.current > 0 ET serveur dit > 0 → on peut
-        // effacer exhaustedAtRef en toute sécurité
-        if (exhaustedAtRef.current !== null) {
-          exhaustedAtRef.current = null;
         }
 
       } catch (err: any) {
-        // Si le serveur rejette avec 400 "Insufficient energy" :
-        // l'énergie locale était déjà à 0, on s'assure que exhaustedAtRef est set
-        if (err?.status === 400 && exhaustedAtRef.current === null) {
-          exhaustedAtRef.current = Date.now();
+        // 400 = énergie insuffisante confirmée par le serveur
+        if (err?.status === 400) {
+          const body = err?.body;
+          applyServerExhaustedAt(body?.energyExhaustedAt ?? null);
           displayEnergyRef.current = 0;
           setDisplayEnergy(0);
         }
@@ -307,7 +295,7 @@ export default function GamePage() {
   };
 
   // ----------------------------------------------------------------
-  // handleTap
+  // handleTap — mise à jour optimiste, sans toucher serverExhaustedAtRef
   // ----------------------------------------------------------------
   const handleTap = useCallback((e: React.PointerEvent) => {
     if (e.isPrimary === false) return;
@@ -317,30 +305,18 @@ export default function GamePage() {
 
     hapticImpact('light');
 
-    const newEnergy  = Math.max(0, displayEnergyRef.current - 1);
-    const newBalance = displayBalanceRef.current + 1;
-    const newTaps    = displayTapsRef.current    + 1;
-
-    // Setter exhaustedAtRef dès que l'affichage passe à 0
-    if (Math.floor(newEnergy) === 0 && exhaustedAtRef.current === null) {
-      exhaustedAtRef.current = Date.now();
-    }
-
-    if (tapPendingRef.current === 0) {
-      batchStartTimeRef.current = Date.now();
-    }
-
-    displayEnergyRef.current  = newEnergy;
-    displayBalanceRef.current = newBalance;
-    displayTapsRef.current    = newTaps;
-    setDisplayEnergy(newEnergy);
-    setDisplayBalance(newBalance);
-    setDisplayTaps(newTaps);
+    displayEnergyRef.current  = Math.max(0, displayEnergyRef.current - 1);
+    displayBalanceRef.current += 1;
+    displayTapsRef.current    += 1;
+    setDisplayEnergy(displayEnergyRef.current);
+    setDisplayBalance(displayBalanceRef.current);
+    setDisplayTaps(displayTapsRef.current);
 
     const id = Date.now() + Math.random();
     setFloatingCoins(prev => [...prev, { id, x: e.clientX, y: e.clientY, amount: 1 }]);
     setTimeout(() => setFloatingCoins(prev => prev.filter(c => c.id !== id)), 1000);
 
+    if (tapPendingRef.current === 0) batchStartTimeRef.current = Date.now();
     tapPendingRef.current += 1;
     clearTimeout(batchTimerRef.current);
     batchTimerRef.current = setTimeout(() => flushBatchRef.current?.(), 800);
@@ -368,7 +344,7 @@ export default function GamePage() {
     : 'from-red-700 to-red-500';
 
   const isExhausted = Math.floor(displayEnergy) < 1;
-  const regenLabel  = isExhausted ? 'Recharge en cours…' : 'Tap to train';
+  const regenLabel  = isExhausted ? 'Recharge en cours\u2026' : 'Tap to train';
   const regenSub    = isExhausted ? '' : '+1 coin par tap';
 
   return (
