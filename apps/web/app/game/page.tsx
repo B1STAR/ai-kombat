@@ -61,11 +61,9 @@ export default function GamePage() {
   const displayTapsRef    = useRef<number>(0);
   const displayEnergyRef  = useRef<number>(0);
 
-  // Sync depuis le store uniquement quand aucun tap n'est en vol.
-  // FIX #1 : user?.energy retiré des dépendances — le timer tick() met à jour
-  // user.energy dans Zustand toutes les 500ms, ce qui retriggère ce useEffect
-  // et écrase displayEnergyRef au mauvais moment (race condition).
-  // L'énergie display est désormais gérée UNIQUEMENT par le timer et flushBatch.
+  // Sync balance/taps depuis le store uniquement quand aucun tap n'est en vol.
+  // L'énergie n'est PAS synchronisée ici — elle est gérée exclusivement
+  // par le timer tick() et par flushBatch après confirmation serveur.
   useEffect(() => {
     if (!user) return;
     if (tapPendingRef.current === 0 && batchInFlightRef.current === null) {
@@ -78,14 +76,14 @@ export default function GamePage() {
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
 
-  const lastTouchRef     = useRef<number>(0);
   const tapPendingRef    = useRef(0);
   const batchTimerRef    = useRef<NodeJS.Timeout>();
   const batchInFlightRef = useRef<Promise<void> | null>(null);
   const exhaustedAtRef   = useRef<number | null>(null);
-
-  // durationMs : mesure la durée réelle du batch pour l'anti-triche
   const batchStartTimeRef = useRef<number>(0);
+  // Timestamp du moment où le batch a été envoyé — pour corriger la regen
+  // accumulée pendant le vol réseau (Fix C)
+  const batchSentAtRef   = useRef<number>(0);
 
   // ----------------------------------------------------------------
   // Init
@@ -106,12 +104,7 @@ export default function GamePage() {
         setDisplayBalance(u.coin_balance);
         setDisplayTaps(u.total_taps);
         setDisplayEnergy(u.energy);
-        // Si l'énergie arrive déjà à 0 depuis le serveur, on arme exhaustedAtRef
-        if (u.energy <= 0) {
-          exhaustedAtRef.current = Date.now();
-        } else {
-          exhaustedAtRef.current = null;
-        }
+        exhaustedAtRef.current = u.energy <= 0 ? Date.now() : null;
       } catch {
         if (!isTelegram) {
           const devUser = {
@@ -138,7 +131,10 @@ export default function GamePage() {
   }, [isReady, initData]);
 
   // ----------------------------------------------------------------
-  // Timer regen — créé une seule fois, lit les refs
+  // Timer regen — créé une seule fois, lit UNIQUEMENT les refs display.
+  // FIX B : ne touche PLUS le store Zustand — supprime la race condition
+  // qui causait des re-renders en cascade via useEffect [coin_balance, total_taps].
+  // Le store est mis à jour exclusivement par flushBatch.
   // ----------------------------------------------------------------
   const lastTickRef = useRef<number>(Date.now());
 
@@ -152,9 +148,7 @@ export default function GamePage() {
       const maxE = maxEnergyRef.current;
 
       if (cur <= 0) {
-        // Pas encore épuisé côté ref → rien à faire
         if (exhaustedAtRef.current === null) return;
-        // Délai de 30s avant que la regen commence
         if (now - exhaustedAtRef.current < REGEN_DELAY_MS) return;
       }
 
@@ -166,18 +160,11 @@ export default function GamePage() {
       displayEnergyRef.current = newE;
       setDisplayEnergy(newE);
 
-      // Dès que l'énergie remonte à >= 1,
-      // on efface exhaustedAtRef pour signaler la fin de l'épuisement.
       if (Math.floor(newE) >= 1 && exhaustedAtRef.current !== null) {
         exhaustedAtRef.current = null;
       }
-
-      useGameStore.setState((state) => {
-        if (!state.user) return {};
-        const updated = { ...state.user, energy: newE };
-        userRef.current = updated;
-        return { user: updated };
-      });
+      // FIX B : PAS de useGameStore.setState() ici.
+      // Le store n'est mis à jour que dans flushBatch.
     };
 
     const id = setInterval(tick, 500);
@@ -185,7 +172,7 @@ export default function GamePage() {
   }, []);
 
   // ----------------------------------------------------------------
-  // flushBatch — envoie le batch + durationMs pour l'anti-triche
+  // flushBatch
   // ----------------------------------------------------------------
   const flushBatchRef = useRef<() => Promise<void>>();
 
@@ -202,13 +189,14 @@ export default function GamePage() {
     if (batchCount === 0) return;
     tapPendingRef.current = 0;
 
-    // durationMs = temps écoulé depuis le premier tap du batch
     const durationMs = batchStartTimeRef.current > 0
       ? Date.now() - batchStartTimeRef.current
       : undefined;
     batchStartTimeRef.current = 0;
 
     const doFlush = async () => {
+      // FIX C : on note l'heure d'envoi pour corriger la regen du vol réseau
+      batchSentAtRef.current = Date.now();
       try {
         const response = await apiRef.current.post<any>('/api/tap', {
           count           : batchCount,
@@ -216,51 +204,47 @@ export default function GamePage() {
           durationMs,
         });
 
-        // FIX #2 : préserver les taps arrivés PENDANT le vol réseau.
-        // tapPendingRef.current contient les taps accumulés depuis que
-        // batchCount a été capturé (tapPendingRef = 0). Ces taps sont
-        // déjà déduits localement dans displayBalanceRef/displayTapsRef
-        // mais la réponse DB ne les connaît pas encore → on les rajoute
-        // pour éviter que le display recule visuellement.
+        // FIX #2 : préserver les taps arrivés pendant le vol réseau
         const pendingAfter = tapPendingRef.current;
         displayBalanceRef.current = response.newBalance   + pendingAfter;
         displayTapsRef.current    = response.newTotalTaps + pendingAfter;
         setDisplayBalance(response.newBalance   + pendingAfter);
         setDisplayTaps(response.newTotalTaps    + pendingAfter);
 
-        // ── ÉNERGIE : FIX ANTI-SAUT ──────────────────────────────────────
-        //
-        // Le seuil de désync est adaptatif :
-        //   tolérance = batchCount + 5 (marge regen latence réseau)
-        // Un écart local - DB > tolérance → recalage justifié (taps rejetés).
-        // Un écart local - DB <= tolérance → on garde le display local.
-
+        // FIX C : énergie ancrée sur le temps de vol réseau
+        // On ajoute la regen accumulée pendant la latence à dbEnergy
+        // avant toute comparaison avec le display local.
+        // Cela supprime le saut systématique post-batch.
         if (response.newEnergy <= 0) {
-          // Épuisement confirmé par le serveur
           displayEnergyRef.current = 0;
           setDisplayEnergy(0);
           if (exhaustedAtRef.current === null) {
             exhaustedAtRef.current = Date.now();
           }
         } else {
+          const flightMs    = Date.now() - batchSentAtRef.current;
+          const regenFlight = (flightMs / 1000) * REGEN_PER_SEC;
+          // dbEnergy corrigé = ce que le serveur a retourné + regen accumulée pendant le vol
+          const dbEnergyAdjusted = Math.min(
+            maxEnergyRef.current,
+            response.newEnergy + regenFlight,
+          );
+
           const localEnergy = displayEnergyRef.current;
-          const dbEnergy    = response.newEnergy;
           const maxE        = maxEnergyRef.current;
+          // Tolérance adaptative : batchCount + marge de 5
+          const tolerance   = batchCount + 5;
 
-          // Tolérance adaptative : écart attendu = batchCount (taps envoyés)
-          // + 5 points de marge pour la regen pendant la latence réseau.
-          const tolerance = batchCount + 5;
-
-          if (localEnergy > dbEnergy + tolerance) {
-            // Désync réelle : des taps ont été perdus/rejetés côté serveur.
-            displayEnergyRef.current = dbEnergy;
-            setDisplayEnergy(dbEnergy);
-          } else if (localEnergy < dbEnergy) {
-            // DB confirme une énergie plus haute (ex. regen cron côté serveur).
-            displayEnergyRef.current = Math.min(dbEnergy, maxE);
-            setDisplayEnergy(Math.min(dbEnergy, maxE));
+          if (localEnergy > dbEnergyAdjusted + tolerance) {
+            // Désync réelle : recalage sur la valeur DB corrigée
+            displayEnergyRef.current = dbEnergyAdjusted;
+            setDisplayEnergy(dbEnergyAdjusted);
+          } else if (localEnergy < dbEnergyAdjusted) {
+            // DB (+ regen vol) confirme une énergie plus haute
+            displayEnergyRef.current = Math.min(dbEnergyAdjusted, maxE);
+            setDisplayEnergy(Math.min(dbEnergyAdjusted, maxE));
           }
-          // Sinon : écart dans la tolérance → on garde le display local.
+          // Dans la tolérance → on garde le display local (pas de saut)
 
           if (exhaustedAtRef.current !== null) {
             exhaustedAtRef.current = null;
@@ -294,18 +278,17 @@ export default function GamePage() {
 
   // ----------------------------------------------------------------
   // handleTap
+  // FIX A : onPointerDown remplace onClick + onTouchStart.
+  // Sur mobile React déclenche touchstart ET click (~300ms après).
+  // onPointerDown est déclenché une seule fois par interaction physique,
+  // sans doublon, sur tous les devices.
   // ----------------------------------------------------------------
-  const handleTap = useCallback((e: React.MouseEvent | React.TouchEvent) => {
-    if (e.type === 'click'       && Date.now() - lastTouchRef.current < 500) return;
-    if (e.type === 'touchstart')   lastTouchRef.current = Date.now();
+  const handleTap = useCallback((e: React.PointerEvent) => {
+    // Ignorer les pointer non-primaires (stylet secondaire, multi-touch parasite)
+    if (e.isPrimary === false) return;
 
-    // Math.floor pour éviter qu'un float 0.83 passe le guard
     const energy = Math.floor(displayEnergyRef.current);
     if (energy < 1) { hapticNotification('error'); return; }
-
-    let clientX = 0, clientY = 0;
-    if ('touches' in e && e.touches[0]) { clientX = e.touches[0].clientX; clientY = e.touches[0].clientY; }
-    else if ('clientX' in e)             { clientX = e.clientX;            clientY = e.clientY; }
 
     hapticImpact('light');
 
@@ -317,7 +300,6 @@ export default function GamePage() {
       exhaustedAtRef.current = Date.now();
     }
 
-    // Marquer le début du batch pour durationMs
     if (tapPendingRef.current === 0) {
       batchStartTimeRef.current = Date.now();
     }
@@ -330,7 +312,7 @@ export default function GamePage() {
     setDisplayTaps(newTaps);
 
     const id = Date.now() + Math.random();
-    setFloatingCoins(prev => [...prev, { id, x: clientX, y: clientY, amount: 1 }]);
+    setFloatingCoins(prev => [...prev, { id, x: e.clientX, y: e.clientY, amount: 1 }]);
     setTimeout(() => setFloatingCoins(prev => prev.filter(c => c.id !== id)), 1000);
 
     tapPendingRef.current += 1;
@@ -448,10 +430,10 @@ export default function GamePage() {
       </div>
 
       {/* BOUTON TAP */}
+      {/* FIX A : onPointerDown remplace onClick+onTouchStart — pas de doublon sur mobile */}
       <div className="flex justify-center px-6">
         <motion.button
-          onClick={handleTap}
-          onTouchStart={handleTap}
+          onPointerDown={handleTap}
           style={{
             width: '260px', height: '260px', borderRadius: '50%',
             background: 'radial-gradient(circle at 40% 35%, #1e1b40 0%, #0e0d1e 70%)',
