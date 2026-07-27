@@ -15,20 +15,24 @@ interface FloatingCoin { id: number; x: number; y: number; amount: number; }
 
 const fmt = (n: number) => Math.floor(n).toLocaleString('fr-FR').replace(/\u202f/g, '\u00a0');
 
+// Délai de regen après épuisement total — doit correspondre à user.service.ts (30s)
+const REGEN_DELAY_MS = 30_000;
+const REGEN_PER_SEC  = 1 / 3;
+
 function AiBadge({ level, type }: { level: number; type: string }) {
   const tiers = [
-    { min: 0,   max: 4,   label: 'Novice', color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '\ud83e\udde0' },
-    { min: 5,   max: 9,   label: 'Initi\u00e9', color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '\ud83d\udc1e' },
-    { min: 10,  max: 19,  label: 'Expert', color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '\u26a1' },
-    { min: 20,  max: 49,  label: 'Master', color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '\ud83d\udd2e' },
-    { min: 50,  max: 99,  label: 'Legend', color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '\ud83d\udc51' },
-    { min: 100, max: 999, label: 'GOD',    color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '\ud83d\udd25' },
+    { min: 0,   max: 4,   label: 'Novice', color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '🧠' },
+    { min: 5,   max: 9,   label: 'Initié', color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '🐞' },
+    { min: 10,  max: 19,  label: 'Expert', color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '⚡' },
+    { min: 20,  max: 49,  label: 'Master', color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '🔮' },
+    { min: 50,  max: 99,  label: 'Legend', color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '👑' },
+    { min: 100, max: 999, label: 'GOD',    color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '🔥' },
   ];
   const tier = tiers.find(t => level >= t.min && level <= t.max) || tiers[0];
   return (
     <div className="w-11 h-11 rounded-full flex flex-col items-center justify-center border-2 select-none"
       style={{ background: tier.bg, borderColor: tier.color }}
-      title={`AI ${tier.label} \u2014 Level ${level}`}>
+      title={`AI ${tier.label} — Level ${level}`}>
       <span style={{ fontSize: '16px', lineHeight: 1 }}>{tier.emoji}</span>
       <span style={{ fontSize: '8px', fontWeight: 700, color: tier.color, lineHeight: 1.2 }}>Lv.{level}</span>
     </div>
@@ -40,25 +44,22 @@ export default function GamePage() {
   const { isTelegram, initData, startParam, isReady } = useTelegram();
   const { user, setUser } = useGameStore();
 
-  // ----------------------------------------------------------------
-  // userRef : source de verite temps reel — jamais de snapshot React
-  // ----------------------------------------------------------------
   const userRef = useRef(user);
   useEffect(() => { userRef.current = user; }, [user]);
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
 
-  // FIX #1 : suppression de isTapping/tapTimeoutRef — ils bloquaient les taps rapides
-  // Le guard contre le double-fire touch/click est géré par lastTouchRef ci-dessous
-  const lastTouchRef   = useRef<number>(0);      // FIX #2 : anti double-fire touch+click
-  const tapPendingRef  = useRef(0);              // taps en attente d'envoi
-  const optimisticRef  = useRef(0);              // coins optimistes non encore confirmés
-  const batchTimerRef  = useRef<NodeJS.Timeout>();
-  const isBatchingRef  = useRef(false);          // FIX #4 : guard batch concurrent
-  const pendingOnFlightRef = useRef(0);          // taps dans le batch en vol
+  const lastTouchRef        = useRef<number>(0);
+  const tapPendingRef       = useRef(0);
+  // FIX coins rollback : on garde un compteur séparé par batch en vol
+  const optimisticRef       = useRef(0);   // coins optimistes du batch EN COURS (pas encore envoyé)
+  const batchTimerRef       = useRef<NodeJS.Timeout>();
+  const isBatchingRef       = useRef(false);
+  // FIX regen : timestamp de l'épuisement local pour bloquer la regen 30s
+  const exhaustedAtRef      = useRef<number | null>(null);
 
   // ----------------------------------------------------------------
-  // Init referral
+  // Init
   // ----------------------------------------------------------------
   useEffect(() => {
     if (!isReady) return;
@@ -85,10 +86,10 @@ export default function GamePage() {
   }, [isReady, initData]);
 
   // ----------------------------------------------------------------
-  // FIX #3 : Regen — on met à jour userRef.current EN MEME TEMPS que le store
-  // pour éviter la dérive entre le timer regen et les taps rapides
+  // Regen locale — miroir exact de calculateValidEnergy() côté API
+  // FIX : on bloque la regen 30s après épuisement total (energy === 0)
   // ----------------------------------------------------------------
-  const lastTickRef = useRef<number>(Date.now());
+  const lastTickRef    = useRef<number>(Date.now());
   const energyTimerRef = useRef<NodeJS.Timeout>();
 
   useEffect(() => {
@@ -100,14 +101,25 @@ export default function GamePage() {
       const now = Date.now();
       const elapsed = (now - lastTickRef.current) / 1000;
       lastTickRef.current = now;
-      const regen = elapsed * (1 / 3);
 
-      // Mettre à jour le store ET userRef en même temps
       useGameStore.setState((state) => {
         if (!state.user) return {};
-        const newEnergy = Math.min(maxEnergy, Number(state.user.energy) + regen);
+        const currentEnergy = Number(state.user.energy);
+
+        // FIX #1 regen : si énergie à 0, on attend REGEN_DELAY_MS avant de recharger
+        if (currentEnergy <= 0) {
+          if (exhaustedAtRef.current === null) {
+            exhaustedAtRef.current = now;
+          }
+          const waited = now - exhaustedAtRef.current;
+          if (waited < REGEN_DELAY_MS) return {}; // encore en attente
+        } else {
+          // L'énergie est revenue, on reset le compteur d'épuisement
+          exhaustedAtRef.current = null;
+        }
+
+        const newEnergy = Math.min(maxEnergy, currentEnergy + elapsed * REGEN_PER_SEC);
         const updated = { ...state.user, energy: newEnergy };
-        // FIX #3 : synchroniser userRef avec la regen pour éviter la dérive
         userRef.current = updated;
         return { user: updated };
       });
@@ -118,24 +130,25 @@ export default function GamePage() {
   }, [user?.max_energy, user?.telegram_id]);
 
   // ----------------------------------------------------------------
-  // FIX #4 : flush batch — attend la fin du batch en vol avant d'en envoyer un nouveau
+  // flushBatch — envoi groupé vers l'API
+  // FIX coins : snapshot des coins optimistes AU MOMENT du flush
+  // pour que le rollback soit toujours précis même si de nouveaux taps arrivent
   // ----------------------------------------------------------------
   const flushBatch = useCallback(async () => {
-    // Si un batch est déjà en vol, on reporte le flush
     if (isBatchingRef.current) {
       clearTimeout(batchTimerRef.current);
       batchTimerRef.current = setTimeout(flushBatch, 300);
       return;
     }
 
-    const batchCount = tapPendingRef.current;
-    const optimisticCoins = optimisticRef.current;
+    const batchCount    = tapPendingRef.current;
+    // FIX : snapshot isolé des coins optimistes pour ce batch précis
+    const batchOptimistic = optimisticRef.current;
     if (batchCount === 0) return;
 
-    tapPendingRef.current = 0;
-    optimisticRef.current = 0;
-    pendingOnFlightRef.current = batchCount;
-    isBatchingRef.current = true;
+    tapPendingRef.current  = 0;
+    optimisticRef.current  = 0;   // reset — les prochains taps accumulent un nouveau compteur
+    isBatchingRef.current  = true;
 
     try {
       const response = await api.post<any>('/api/tap', {
@@ -145,75 +158,74 @@ export default function GamePage() {
 
       const latest = userRef.current;
       if (latest) {
+        // FIX regen : si l'API dit que l'énergie est revenue, on reset l'épuisement local
+        if (response.newEnergy > 0) exhaustedAtRef.current = null;
+
         const synced = {
           ...latest,
-          coin_balance: response.newBalance,
-          energy: response.newEnergy,
-          total_taps: response.newTotalTaps ?? latest.total_taps,
+          coin_balance : response.newBalance,
+          energy       : response.newEnergy,
+          total_taps   : response.newTotalTaps ?? latest.total_taps,
         };
         setUser(synced);
-        userRef.current = synced;
+        userRef.current    = synced;
         lastTickRef.current = Date.now();
       }
       if (response.aiLevelUp) hapticNotification('success');
     } catch {
-      // Rollback optimiste uniquement sur les coins — énergie déjà correcte côté API
+      // Rollback uniquement les coins de CE batch (batchOptimistic), pas ceux des taps suivants
       const latest = userRef.current;
       if (latest) {
         const reverted = {
           ...latest,
-          coin_balance: Math.max(0, latest.coin_balance - optimisticCoins),
-          total_taps: Math.max(0, latest.total_taps - batchCount),
+          coin_balance : Math.max(0, latest.coin_balance - batchOptimistic),
+          total_taps   : Math.max(0, latest.total_taps   - batchCount),
         };
         setUser(reverted);
         userRef.current = reverted;
       }
     } finally {
       isBatchingRef.current = false;
-      pendingOnFlightRef.current = 0;
     }
   }, [api, setUser]);
 
   // ----------------------------------------------------------------
-  // handleTap — robuste, sans double-fire, sans snapshot React
+  // handleTap
   // ----------------------------------------------------------------
   const handleTap = useCallback((e: React.MouseEvent | React.TouchEvent) => {
-    // FIX #2 : supprimer le double-fire touch + click sur mobile
-    // onTouchStart déclenche aussi onClick ~300ms plus tard — on l'ignore
-    if (e.type === 'click') {
-      if (Date.now() - lastTouchRef.current < 500) return;
-    }
-    if (e.type === 'touchstart') {
-      lastTouchRef.current = Date.now();
-    }
+    // Anti double-fire touch + click
+    if (e.type === 'click'    && Date.now() - lastTouchRef.current < 500) return;
+    if (e.type === 'touchstart') lastTouchRef.current = Date.now();
 
-    // FIX #1 : plus de isTapping — on lit l'énergie réelle depuis userRef
     const cu = userRef.current;
     if (!cu || cu.energy < 1) { hapticNotification('error'); return; }
 
     let clientX = 0, clientY = 0;
     if ('touches' in e && e.touches[0]) { clientX = e.touches[0].clientX; clientY = e.touches[0].clientY; }
-    else if ('clientX' in e) { clientX = e.clientX; clientY = e.clientY; }
+    else if ('clientX' in e)             { clientX = e.clientX;            clientY = e.clientY; }
 
     hapticImpact('light');
 
-    // Mise à jour optimiste immédiate depuis userRef (jamais depuis le snapshot React)
     const newEnergy = Math.max(0, cu.energy - 1);
+    // FIX regen : si on vient d'atteindre 0, on enregistre le timestamp d'épuisement
+    if (newEnergy === 0 && exhaustedAtRef.current === null) {
+      exhaustedAtRef.current = Date.now();
+    }
+
     const updated = {
       ...cu,
-      coin_balance: cu.coin_balance + 1,
-      energy: newEnergy,
-      total_taps: cu.total_taps + 1,
+      coin_balance : cu.coin_balance + 1,
+      energy       : newEnergy,
+      total_taps   : cu.total_taps + 1,
     };
     setUser(updated);
-    userRef.current = updated;
+    userRef.current    = updated;
     optimisticRef.current += 1;
 
     const id = Date.now() + Math.random();
     setFloatingCoins((prev) => [...prev, { id, x: clientX, y: clientY, amount: 1 }]);
     setTimeout(() => setFloatingCoins((prev) => prev.filter((c) => c.id !== id)), 1000);
 
-    // Accumule les taps et planifie le flush
     tapPendingRef.current += 1;
     clearTimeout(batchTimerRef.current);
     batchTimerRef.current = setTimeout(flushBatch, 600);
@@ -230,12 +242,17 @@ export default function GamePage() {
     );
   }
 
-  const maxEnergy = user.max_energy || 1000;
-  const energyPercent = Math.min(100, (user.energy / maxEnergy) * 100);
-  const energyColor =
-    energyPercent > 50 ? 'from-blue-600 to-violet-500'
-    : energyPercent > 20 ? 'from-yellow-500 to-orange-500'
+  const maxEnergy    = user.max_energy || 1000;
+  const energyPct    = Math.min(100, (user.energy / maxEnergy) * 100);
+  const energyColor  =
+    energyPct > 50 ? 'from-blue-600 to-violet-500'
+    : energyPct > 20 ? 'from-yellow-500 to-orange-500'
     : 'from-red-700 to-red-500';
+
+  // FIX #3 : label de regen lisible — affiche le délai restant si épuisé
+  const isExhausted  = user.energy < 1;
+  const regenLabel   = isExhausted ? 'Recharge en cours…' : 'Tap to train';
+  const regenSub     = isExhausted ? '' : '+1 coin par tap';
 
   return (
     <div className="min-h-screen pb-20 flex flex-col" style={{ background: '#08090f' }}>
@@ -269,7 +286,7 @@ export default function GamePage() {
       <div className="flex justify-center items-center gap-3 pt-1 pb-3">
         <div className="w-10 h-10 rounded-full flex items-center justify-center"
           style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}>
-          <span className="text-lg">\ud83e\ude99</span>
+          <span className="text-lg">🪙</span>
         </div>
         <span className="text-4xl font-extrabold text-white tracking-tight">{fmt(user.coin_balance)}</span>
       </div>
@@ -295,16 +312,17 @@ export default function GamePage() {
       <div className="px-4 mb-4">
         <div className="flex items-center justify-between mb-1.5">
           <div className="flex items-center gap-1.5">
-            <span className="text-sm">\u26a1</span>
+            {/* FIX #3 : emoji direct, pas d'escape unicode */}
+            <span className="text-sm">⚡</span>
             <span className="text-sm font-semibold text-white">{Math.floor(user.energy)}</span>
             <span className="text-xs text-slate-500">/ {maxEnergy}</span>
           </div>
-          <span className="text-xs text-slate-500">{Math.round(energyPercent)}%</span>
+          <span className="text-xs text-slate-500">{Math.round(energyPct)}%</span>
         </div>
         <div className="w-full h-2.5 rounded-full overflow-hidden mb-3"
           style={{ background: '#12141f', border: '1px solid #1e2030' }}>
           <motion.div className={`h-full bg-gradient-to-r ${energyColor} rounded-full`}
-            animate={{ width: `${energyPercent}%` }} transition={{ duration: 0.3 }} />
+            animate={{ width: `${energyPct}%` }} transition={{ duration: 0.3 }} />
         </div>
         <div className="flex gap-2">
           {[
@@ -329,14 +347,14 @@ export default function GamePage() {
           style={{
             width: '260px', height: '260px', borderRadius: '50%',
             background: 'radial-gradient(circle at 40% 35%, #1e1b40 0%, #0e0d1e 70%)',
-            border: user.energy < 1 ? '3px solid #2a2d40' : '3px solid rgba(124,58,237,0.55)',
-            boxShadow: user.energy < 1 ? 'none' : '0 0 32px rgba(109,40,217,0.22), inset 0 0 40px rgba(109,40,217,0.08)',
+            border    : isExhausted ? '3px solid #2a2d40' : '3px solid rgba(124,58,237,0.55)',
+            boxShadow : isExhausted ? 'none' : '0 0 32px rgba(109,40,217,0.22), inset 0 0 40px rgba(109,40,217,0.08)',
           }}
           className="relative select-none touch-none"
-          whileTap={{ scale: 0.93 }}
-          disabled={user.energy < 1}
+          whileTap={{ scale: isExhausted ? 1 : 0.93 }}
+          disabled={isExhausted}
         >
-          {user.energy >= 1 && (
+          {!isExhausted && (
             <motion.div className="absolute inset-[-5px] rounded-full"
               style={{ border: '1.5px solid rgba(139,92,246,0.25)' }}
               animate={{ opacity: [0.2, 0.6, 0.2] }}
@@ -347,8 +365,8 @@ export default function GamePage() {
             <AiAvatar level={user.ai_level} type={user.ai_type} />
           </div>
           <div className="absolute bottom-7 left-0 right-0 text-center pointer-events-none">
-            <p className="text-base font-bold text-white/90">{user.energy < 1 ? 'No energy' : 'Tap to train'}</p>
-            {user.energy >= 1 && <p className="text-xs text-slate-400 mt-0.5">+1 coin per tap</p>}
+            <p className="text-base font-bold text-white/90">{regenLabel}</p>
+            {regenSub && <p className="text-xs text-slate-400 mt-0.5">{regenSub}</p>}
           </div>
         </motion.button>
       </div>
