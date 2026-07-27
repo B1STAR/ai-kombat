@@ -72,15 +72,29 @@ export default function GamePage() {
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
 
-  const tapPendingRef    = useRef(0);
-  const batchTimerRef    = useRef<NodeJS.Timeout>();
-  const batchInFlightRef = useRef<Promise<void> | null>(null);
-  const exhaustedAtRef   = useRef<number | null>(null);
+  const tapPendingRef     = useRef(0);
+  const batchTimerRef     = useRef<NodeJS.Timeout>();
+  const batchInFlightRef  = useRef<Promise<void> | null>(null);
+  const exhaustedAtRef    = useRef<number | null>(null);
   const batchStartTimeRef = useRef<number>(0);
   const batchSentAtRef    = useRef<number>(0);
 
+  // ── exhaustedAtRef : source de vérité locale pour le mode épuisé ──────────
+  //
+  // Règle ABSOLUE :
+  //   exhaustedAtRef est SET   quand displayEnergyRef passe à 0.
+  //   exhaustedAtRef est CLEAR seulement si displayEnergyRef > 0 ET
+  //                            le serveur confirme newEnergy > 0.
+  //   Il ne doit JAMAIS être effacé par une réponse serveur
+  //   correspondant à un batch ANTÉRIEUR à l'épuisement.
+  //
+  // Le batchOriginEnergyRef mémorise la valeur de displayEnergyRef
+  // au moment où le batch est envoyé. Si cette valeur était > 0 mais
+  // que displayEnergyRef est maintenant à 0, on ne touche pas exhaustedAtRef.
+  const batchOriginEnergyRef = useRef<number>(0);
+
   // ----------------------------------------------------------------
-  // Init — exhaustedAtRef ancré sur energy_exhausted_at DB (fix racine)
+  // Init
   // ----------------------------------------------------------------
   useEffect(() => {
     if (!isReady) return;
@@ -97,11 +111,11 @@ export default function GamePage() {
         setDisplayBalance(u.coin_balance);
         setDisplayTaps(u.total_taps);
 
+        // Reconstruire l'état d'énergie depuis le timestamp DB
         if (u.energy_exhausted_at) {
           exhaustedAtRef.current = new Date(u.energy_exhausted_at).getTime();
           const now          = Date.now();
           const regenStartAt = exhaustedAtRef.current + REGEN_DELAY_MS;
-
           if (now >= regenStartAt) {
             const secondsPassed = (now - regenStartAt) / 1000;
             const regenedEnergy = Math.min(
@@ -110,9 +124,7 @@ export default function GamePage() {
             );
             displayEnergyRef.current = regenedEnergy;
             setDisplayEnergy(regenedEnergy);
-            if (Math.floor(regenedEnergy) >= u.max_energy) {
-              exhaustedAtRef.current = null;
-            }
+            if (Math.floor(regenedEnergy) >= u.max_energy) exhaustedAtRef.current = null;
           } else {
             displayEnergyRef.current = Math.max(0, u.energy);
             setDisplayEnergy(Math.max(0, u.energy));
@@ -207,6 +219,11 @@ export default function GamePage() {
       : undefined;
     batchStartTimeRef.current = 0;
 
+    // Snapshot de l'énergie AU MOMENT de l'envoi
+    // Permet de détecter si l'épuisement est survenu PENDANT le vol réseau
+    const energyAtBatchSend = displayEnergyRef.current;
+    batchOriginEnergyRef.current = energyAtBatchSend;
+
     const doFlush = async () => {
       batchSentAtRef.current = Date.now();
       try {
@@ -222,48 +239,64 @@ export default function GamePage() {
         setDisplayBalance(response.newBalance   + pendingAfter);
         setDisplayTaps(response.newTotalTaps    + pendingAfter);
 
+        // ── RÈGLE CRITIQUE : gestion de exhaustedAtRef après réponse serveur ──
+        //
+        // On ne touche exhaustedAtRef QUE si displayEnergyRef.current > 0
+        // au moment de la réponse. Si le display est à 0, l'épuisement a eu
+        // lieu PENDANT le vol réseau : la réponse concerne un batch
+        // antérieur à l'épuisement → on NE TOUCHE PAS exhaustedAtRef.
+        //
+        // Cas 1 : le serveur confirme l'épuisement (newEnergy <= 0)
         if (response.newEnergy <= 0) {
           displayEnergyRef.current = 0;
           setDisplayEnergy(0);
+          // Toujours setter exhaustedAtRef si pas déjà set
           if (exhaustedAtRef.current === null) {
             exhaustedAtRef.current = Date.now();
           }
-        } else {
-          const flightMs         = Date.now() - batchSentAtRef.current;
-          const regenFlight      = (flightMs / 1000) * REGEN_PER_SEC;
-          const dbEnergyAdjusted = Math.min(maxEnergyRef.current, response.newEnergy + regenFlight);
-          const localEnergy      = displayEnergyRef.current;
-          const maxE             = maxEnergyRef.current;
-          const tolerance        = batchCount + 5;
-
-          if (localEnergy > dbEnergyAdjusted + tolerance) {
-            displayEnergyRef.current = dbEnergyAdjusted;
-            setDisplayEnergy(dbEnergyAdjusted);
-          } else if (localEnergy < dbEnergyAdjusted) {
-            displayEnergyRef.current = Math.min(dbEnergyAdjusted, maxE);
-            setDisplayEnergy(Math.min(dbEnergyAdjusted, maxE));
-          }
-
-          if (exhaustedAtRef.current !== null) {
-            exhaustedAtRef.current = null;
-          }
+          return; // rien d'autre à faire
         }
 
-        const latest = userRef.current;
-        if (latest) {
-          const synced = {
-            ...latest,
-            coin_balance: response.newBalance,
-            energy      : response.newEnergy,
-            total_taps  : response.newTotalTaps ?? latest.total_taps,
-            ai_level    : response.newAiLevel   ?? latest.ai_level,
-          };
-          setUserRef.current(synced);
-          userRef.current = synced;
+        // Cas 2 : le serveur dit newEnergy > 0
+        // Mais l'affichage local est déjà à 0 (épuisement survenu pendant vol)
+        // → NE PAS effacer exhaustedAtRef, NE PAS remonter l'énergie
+        if (Math.floor(displayEnergyRef.current) <= 0) {
+          // Le batch était en vol quand l'épuisement est survenu.
+          // On ignore la réponse énergie du serveur pour ce batch.
+          // exhaustedAtRef reste tel quel (déjà set par handleTap).
+          return;
         }
-        if (response.aiLevelUp) hapticNotification('success');
-      } catch {
-        // pas de rollback
+
+        // Cas 3 : tout va bien, on synchronise l'énergie normalement
+        const flightMs         = Date.now() - batchSentAtRef.current;
+        const regenFlight      = (flightMs / 1000) * REGEN_PER_SEC;
+        const dbEnergyAdjusted = Math.min(maxEnergyRef.current, response.newEnergy + regenFlight);
+        const localEnergy      = displayEnergyRef.current;
+        const maxE             = maxEnergyRef.current;
+        const tolerance        = batchCount + 5;
+
+        if (localEnergy > dbEnergyAdjusted + tolerance) {
+          displayEnergyRef.current = dbEnergyAdjusted;
+          setDisplayEnergy(dbEnergyAdjusted);
+        } else if (localEnergy < dbEnergyAdjusted) {
+          displayEnergyRef.current = Math.min(dbEnergyAdjusted, maxE);
+          setDisplayEnergy(Math.min(dbEnergyAdjusted, maxE));
+        }
+
+        // Ici displayEnergyRef.current > 0 ET serveur dit > 0 → on peut
+        // effacer exhaustedAtRef en toute sécurité
+        if (exhaustedAtRef.current !== null) {
+          exhaustedAtRef.current = null;
+        }
+
+      } catch (err: any) {
+        // Si le serveur rejette avec 400 "Insufficient energy" :
+        // l'énergie locale était déjà à 0, on s'assure que exhaustedAtRef est set
+        if (err?.status === 400 && exhaustedAtRef.current === null) {
+          exhaustedAtRef.current = Date.now();
+          displayEnergyRef.current = 0;
+          setDisplayEnergy(0);
+        }
       } finally {
         batchInFlightRef.current = null;
       }
@@ -288,6 +321,7 @@ export default function GamePage() {
     const newBalance = displayBalanceRef.current + 1;
     const newTaps    = displayTapsRef.current    + 1;
 
+    // Setter exhaustedAtRef dès que l'affichage passe à 0
     if (Math.floor(newEnergy) === 0 && exhaustedAtRef.current === null) {
       exhaustedAtRef.current = Date.now();
     }
