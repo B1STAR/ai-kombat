@@ -226,22 +226,25 @@ export default function GamePage() {
         setDisplayTaps(response.newTotalTaps);
 
         // ── ÉNERGIE : FIX ANTI-SAUT ──────────────────────────────────────
-        // PROBLÈME RACINE du nouveau symptôme :
-        //   Le timer tick() incrémente displayEnergyRef toutes les 500ms.
-        //   Pendant le vol du batch (~1s), il a peut-être monté displayEnergyRef
-        //   de 200 → 205 (regen normale) OU de ~200 → 600 (si on tapait depuis
-        //   le début et que le timer accumule les ticks).
-        //   Si on écrase displayEnergyRef avec response.newEnergy (ex. 190),
-        //   on crée un saut brutal 600 → 190 visible à l'écran.
         //
-        // RÈGLE :
-        //   - Si response.newEnergy = 0 → épuisement confirmé serveur → on force 0.
-        //   - Si response.newEnergy > 0 → on prend le MAX entre la valeur locale
-        //     (avancée par le timer) et la valeur DB (source de vérité basse).
-        //     Le timer a avancé légitimement pendant la latence réseau (~1s de regen)
-        //     donc sa valeur est plus précise pour l'affichage temps réel.
-        //     On met quand même le store Zustand à jour avec response.newEnergy
-        //     pour que la DB reste cohérente.
+        // PROBLÈME RACINE :
+        //   L'ancien seuil fixe de +5 déclenchait un recalage brutal dès que
+        //   le batch dépassait ~5 taps. Ex : batch de 50 taps → DB retourne
+        //   currentEnergy - 50 = 150 alors que le display local est à 200
+        //   (valeur avant tap). L'écart légitime = batchCount = 50 >> 5.
+        //   → Recalage brutal 200 → 150 visible à l'écran.
+        //
+        // FIX :
+        //   Le seuil de désync est maintenant adaptatif :
+        //     tolérance = batchCount + marge_regen_réseau
+        //   où marge_regen_réseau = 2s de regen max ≈ 0.67 point ≈ 2 points
+        //   arrondi généreusement à 5 pour absorber la latence.
+        //
+        //   Un écart local - DB > tolérance signifie que des taps ont été
+        //   rejetés ou perdus côté serveur → recalage justifié.
+        //   Un écart local - DB <= tolérance → on garde le display local,
+        //   source de vérité pour le temps réel.
+
         if (response.newEnergy <= 0) {
           // Épuisement confirmé par le serveur
           displayEnergyRef.current = 0;
@@ -250,30 +253,26 @@ export default function GamePage() {
             exhaustedAtRef.current = Date.now();
           }
         } else {
-          // FIX : on ne recule JAMAIS l'énergie display vers une valeur DB
-          // inférieure à ce que le timer local a déjà affiché.
-          // Exception : si l'écart est > 5 points (désync significative),
-          // on recale sur la valeur DB pour éviter une dérive long-terme.
           const localEnergy = displayEnergyRef.current;
           const dbEnergy    = response.newEnergy;
           const maxE        = maxEnergyRef.current;
 
-          if (localEnergy > dbEnergy + 5) {
-            // Désync significative : le display local est trop haut par rapport
-            // à la DB → recalage doux vers la valeur DB confirmée.
-            // Cela arrive si des taps ont été perdus ou rejetés côté serveur.
+          // Tolérance adaptative : écart attendu = batchCount (taps envoyés)
+          // + 5 points de marge pour la regen pendant la latence réseau.
+          const tolerance = batchCount + 5;
+
+          if (localEnergy > dbEnergy + tolerance) {
+            // Désync réelle : des taps ont été perdus/rejetés côté serveur.
+            // Recalage sur la valeur DB confirmée.
             displayEnergyRef.current = dbEnergy;
             setDisplayEnergy(dbEnergy);
           } else if (localEnergy < dbEnergy) {
-            // DB confirme une énergie plus haute que le display local
-            // (ex. regen cron passée côté serveur) → on prend la valeur DB.
+            // DB confirme une énergie plus haute (ex. regen cron côté serveur).
             displayEnergyRef.current = Math.min(dbEnergy, maxE);
             setDisplayEnergy(Math.min(dbEnergy, maxE));
           }
-          // Sinon : local >= dbEnergy et écart <= 5 → on garde local,
-          // le timer est source de vérité pour l'affichage temps réel.
+          // Sinon : écart dans la tolérance → on garde le display local.
 
-          // Garantir que exhaustedAtRef est null si énergie > 0
           if (exhaustedAtRef.current !== null) {
             exhaustedAtRef.current = null;
           }
@@ -295,7 +294,6 @@ export default function GamePage() {
         if (response.aiLevelUp) hapticNotification('success');
       } catch {
         // Pas de rollback : la DB est sûre (UPDATE atomique)
-        // On remet tapPendingRef à 0 pour débloquer les prochains batchs
       } finally {
         batchInFlightRef.current = null;
       }
