@@ -17,6 +17,7 @@ const fmt = (n: number) => Math.floor(n).toLocaleString('fr-FR').replace(/\u202f
 
 const REGEN_DELAY_MS = 30_000;
 const REGEN_PER_SEC  = 1 / 3;
+const API_URL        = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
 function AiBadge({ level, type }: { level: number; type: string }) {
   const tiers = [
@@ -43,10 +44,14 @@ export default function GamePage() {
   const { isTelegram, initData, startParam, isReady } = useTelegram();
   const { user, setUser } = useGameStore();
 
-  const apiRef     = useRef(api);
-  const setUserRef = useRef(setUser);
-  useEffect(() => { apiRef.current     = api;     }, [api]);
-  useEffect(() => { setUserRef.current = setUser; }, [setUser]);
+  const apiRef      = useRef(api);
+  const setUserRef  = useRef(setUser);
+  // Fix #1 : capturer initData dans un ref pour l'utiliser dans flushViaKeepalive
+  // (les closures de useEffect ne voient pas les mises à jour de state directement)
+  const initDataRef = useRef<string>(initData || '');
+  useEffect(() => { apiRef.current      = api;          }, [api]);
+  useEffect(() => { setUserRef.current  = setUser;      }, [setUser]);
+  useEffect(() => { initDataRef.current = initData || ''; }, [initData]);
 
   const maxEnergyRef = useRef<number>(1000);
   useEffect(() => { if (user?.max_energy) maxEnergyRef.current = user.max_energy; }, [user?.max_energy]);
@@ -61,9 +66,12 @@ export default function GamePage() {
   // SOURCE DE VÉRITÉ UNIQUE : timestamp d'épuisement reçu du serveur.
   // null  = énergie disponible (ou regen terminée).
   // number = ms epoch du moment où le serveur a confirmé l'épuisement.
-  // Ce ref n'est JAMAIS modifié localement par handleTap ou le tick.
+  // Ce ref n'est JAMAIS modifié localement par handleTap.
   // Il est UNIQUEMENT mis à jour par les réponses /api/tap et /api/auth/init.
   const serverExhaustedAtRef = useRef<number | null>(null);
+
+  // Fix #3 : fallback regen si serverExhaustedAtRef=null mais énergie bloquée à 0
+  const energyZeroSinceRef = useRef<number | null>(null);
 
   const tapPendingRef     = useRef(0);
   const batchTimerRef     = useRef<NodeJS.Timeout>();
@@ -97,8 +105,8 @@ export default function GamePage() {
   }, []);
 
   /**
-   * Recalcule l'énergie locale à partir du timestamp serveur et de l'énergie
-   * stockée en DB (base pour la regen). Appelé uniquement à l'init.
+   * Recalcule l'énergie locale à partir du timestamp serveur.
+   * Appelé uniquement à l'init (et uniquement si aucun tap n'est en vol).
    */
   const rebuildEnergyFromServer = useCallback((u: any) => {
     const maxE = u.max_energy || 1000;
@@ -106,6 +114,7 @@ export default function GamePage() {
 
     if (!u.energy_exhausted_at) {
       serverExhaustedAtRef.current = null;
+      energyZeroSinceRef.current   = null;
       displayEnergyRef.current     = Number(u.energy);
       setDisplayEnergy(Number(u.energy));
       return;
@@ -118,15 +127,17 @@ export default function GamePage() {
     const regenStartAt = exhaustedMs + REGEN_DELAY_MS;
 
     if (now < regenStartAt) {
-      // Délai pas encore passé
+      // Délai 30s pas encore passé
       displayEnergyRef.current = 0;
       setDisplayEnergy(0);
+      if (!energyZeroSinceRef.current) energyZeroSinceRef.current = now;
       return;
     }
 
     const secondsPassed = (now - regenStartAt) / 1000;
     const regenedEnergy = Math.min(maxE, Math.max(0, Number(u.energy)) + secondsPassed * REGEN_PER_SEC);
     displayEnergyRef.current = regenedEnergy;
+    energyZeroSinceRef.current = null;
     setDisplayEnergy(regenedEnergy);
 
     if (Math.floor(regenedEnergy) >= maxE) {
@@ -150,7 +161,10 @@ export default function GamePage() {
         displayTapsRef.current    = u.total_taps;
         setDisplayBalance(u.coin_balance);
         setDisplayTaps(u.total_taps);
-        rebuildEnergyFromServer(u);
+        // Fix #2 : ne pas écraser l'énergie locale si des taps sont encore en vol
+        if (tapPendingRef.current === 0 && batchInFlightRef.current === null) {
+          rebuildEnergyFromServer(u);
+        }
       } catch {
         if (!isTelegram) {
           const devUser = {
@@ -175,40 +189,38 @@ export default function GamePage() {
   }, [isReady, initData, rebuildEnergyFromServer]);
 
   // ----------------------------------------------------------------
-  // Flush forcé avant quitter la page (visibilitychange + démontage)
-  // Garantit que energy_exhausted_at est en DB avant le prochain init.
+  // Fix #1 — Flush avant quitter la page via fetch keepalive
+  // (sendBeacon ne peut pas transporter l'Authorization header)
   // ----------------------------------------------------------------
-  useEffect(() => {
-    // sendBeacon : fire-and-forget, survit à l'unload de la page
-    const flushViaSendBeacon = () => {
-      if (tapPendingRef.current === 0) return;
-      const count       = tapPendingRef.current;
-      const durationMs  = batchStartTimeRef.current > 0
-        ? Date.now() - batchStartTimeRef.current
-        : undefined;
-      // sendBeacon ne supporte que URLSearchParams ou Blob
-      const body = JSON.stringify({
+  const flushViaKeepalive = useCallback(() => {
+    if (tapPendingRef.current === 0) return;
+    const count      = tapPendingRef.current;
+    const durationMs = batchStartTimeRef.current > 0
+      ? Date.now() - batchStartTimeRef.current
+      : undefined;
+    tapPendingRef.current     = 0;
+    batchStartTimeRef.current = 0;
+    const currentInitData = initDataRef.current;
+    fetch(`${API_URL}/api/tap`, {
+      method   : 'POST',
+      keepalive: true,
+      headers  : {
+        'Content-Type' : 'application/json',
+        ...(currentInitData ? { Authorization: `tma ${currentInitData}` } : {}),
+      },
+      body: JSON.stringify({
         count,
         clientTimestamp: new Date().toISOString(),
         durationMs,
-      });
-      // On tente sendBeacon via l'URL absolue de l'API
-      const apiBase = process.env.NEXT_PUBLIC_API_URL ?? '';
-      const sent = navigator.sendBeacon(
-        `${apiBase}/api/tap`,
-        new Blob([body], { type: 'application/json' }),
-      );
-      if (sent) {
-        tapPendingRef.current     = 0;
-        batchStartTimeRef.current = 0;
-      }
-    };
+      }),
+    }).catch(() => {});
+  }, []);
 
+  useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
-        // 1. Tenter sendBeacon (fire-and-forget)
-        flushViaSendBeacon();
-        // 2. Annuler le timer batch en attente
+        // Flush keepalive (survit à la navigation, transporte les headers auth)
+        flushViaKeepalive();
         clearTimeout(batchTimerRef.current);
       }
     };
@@ -217,47 +229,57 @@ export default function GamePage() {
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      // Cleanup au démontage : annuler le timer + flush si taps en attente
       clearTimeout(batchTimerRef.current);
+      // Flush au démontage SPA si taps en attente
       if (tapPendingRef.current > 0) {
         flushBatchRef.current?.();
       }
     };
-  }, []);
+  }, [flushViaKeepalive]);
 
   // ----------------------------------------------------------------
   // Timer regen — tic toutes les 500ms
-  // Repose UNIQUEMENT sur serverExhaustedAtRef (jamais modifié localement).
+  // Fix #3 : fallback si serverExhaustedAtRef=null et énergie bloquée à 0 > 35s
   // ----------------------------------------------------------------
   const lastTickRef = useRef<number>(Date.now());
 
   useEffect(() => {
     const tick = () => {
       const now     = Date.now();
-      // Cap elapsed à 2s pour éviter les sauts brutaux après retour d'arrière-plan
       const elapsed = Math.min((now - lastTickRef.current) / 1000, 2);
       lastTickRef.current = now;
 
       const cur  = displayEnergyRef.current;
       const maxE = maxEnergyRef.current;
-      if (cur >= maxE) return;
+      if (cur >= maxE) {
+        energyZeroSinceRef.current = null;
+        return;
+      }
 
       const exhaustedAt = serverExhaustedAtRef.current;
 
       if (cur <= 0) {
-        // Pas d'épuisement connu du serveur : on ne regen pas
-        if (exhaustedAt === null) return;
-        // Délai 30s pas encore passé
-        if (now - exhaustedAt < REGEN_DELAY_MS) return;
+        if (exhaustedAt !== null) {
+          // Timestamp serveur connu : respecter le délai 30s
+          if (now - exhaustedAt < REGEN_DELAY_MS) return;
+        } else {
+          // Fix #3 : pas de timestamp serveur (keepalive peut avoir échoué)
+          // → démarrer quand même la regen après 35s d'énergie à 0
+          if (!energyZeroSinceRef.current) {
+            energyZeroSinceRef.current = now;
+            return;
+          }
+          if (now - energyZeroSinceRef.current < REGEN_DELAY_MS + 5000) return;
+        }
       }
 
       const newE = Math.min(maxE, cur + elapsed * REGEN_PER_SEC);
       if (newE === cur) return;
 
-      displayEnergyRef.current = newE;
+      displayEnergyRef.current   = newE;
+      energyZeroSinceRef.current = null;
       setDisplayEnergy(newE);
 
-      // Regen terminée : efface le timestamp serveur localement
       if (Math.floor(newE) >= maxE) {
         serverExhaustedAtRef.current = null;
       }
@@ -268,7 +290,7 @@ export default function GamePage() {
   }, []);
 
   // ----------------------------------------------------------------
-  // flushBatch — logique simple, sans cas complexes
+  // flushBatch
   // ----------------------------------------------------------------
   const flushBatchRef = useRef<() => Promise<void>>();
 
@@ -307,15 +329,14 @@ export default function GamePage() {
         setDisplayTaps(response.newTotalTaps    + pendingAfter);
 
         // ── Sync énergie depuis le serveur (SOURCE DE VÉRITÉ) ────────────────
-        // On applique toujours energyExhaustedAt reçu du serveur.
         applyServerExhaustedAt(response.energyExhaustedAt ?? null);
 
         if (response.newEnergy <= 0) {
-          // Épuisé : l'énergie locale passe à 0, le tick s'occupera de la regen
-          displayEnergyRef.current = 0;
+          displayEnergyRef.current   = 0;
+          energyZeroSinceRef.current = null; // timestamp serveur fait foi
           setDisplayEnergy(0);
         } else {
-          // Énergie disponible : on corrige l'affichage local si dérive trop large
+          energyZeroSinceRef.current = null;
           const flightMs         = Date.now() - batchSentAtRef.current;
           const regenFlight      = (flightMs / 1000) * REGEN_PER_SEC;
           const serverEnergyAdj  = Math.min(maxEnergyRef.current, response.newEnergy + regenFlight);
@@ -329,11 +350,11 @@ export default function GamePage() {
         }
 
       } catch (err: any) {
-        // 400 = énergie insuffisante confirmée par le serveur
         if (err?.status === 400) {
           const body = err?.body;
           applyServerExhaustedAt(body?.energyExhaustedAt ?? null);
-          displayEnergyRef.current = 0;
+          displayEnergyRef.current   = 0;
+          energyZeroSinceRef.current = null;
           setDisplayEnergy(0);
         }
       } finally {
@@ -346,7 +367,7 @@ export default function GamePage() {
   };
 
   // ----------------------------------------------------------------
-  // handleTap — mise à jour optimiste, sans toucher serverExhaustedAtRef
+  // handleTap
   // ----------------------------------------------------------------
   const handleTap = useCallback((e: React.PointerEvent) => {
     if (e.isPrimary === false) return;
