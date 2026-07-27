@@ -59,7 +59,6 @@ export default function GamePage() {
     if (isTelegram && !initData) return;
     const init = async () => {
       try {
-        // startParam est lu au moment du ready() donc toujours fiable
         const referralCode = startParam.startsWith('ref_') ? startParam : undefined;
         const response = await api.post<{ user: any }>('/api/auth/init', { initData, referralCode });
         setUser(response.user);
@@ -80,9 +79,8 @@ export default function GamePage() {
   }, [isReady, initData]);
 
   // ------------------------------------------------------------------
-  // Recharge énergie basée sur Date.now() — pas d'accumulation d'intervalles
-  // Toutes les secondes on calcule : énergie = min(max, base + Δt * 1/3)
-  // Si l'onglet revient d'arrière-plan, on fait UN seul calcul exact.
+  // Recharge énergie basée sur Date.now()
+  // Toutes les secondes : énergie = min(max, base + Δt * 1/3)
   // ------------------------------------------------------------------
   const energyTimerRef = useRef<NodeJS.Timeout>();
   const lastTickRef = useRef<number>(Date.now());
@@ -93,7 +91,7 @@ export default function GamePage() {
 
     const tick = () => {
       const now = Date.now();
-      const elapsed = (now - lastTickRef.current) / 1000; // secondes réelles — robuste au arriere-plan
+      const elapsed = (now - lastTickRef.current) / 1000;
       lastTickRef.current = now;
 
       const regen = elapsed * (1 / 3);
@@ -107,7 +105,7 @@ export default function GamePage() {
 
     energyTimerRef.current = setInterval(tick, 1000);
     return () => clearInterval(energyTimerRef.current);
-  }, [user?.max_energy, user?.telegram_id]); // recrée seulement si le user change
+  }, [user?.max_energy, user?.telegram_id]);
 
   // ------------------------------------------------------------------
   // Tap handler
@@ -124,7 +122,8 @@ export default function GamePage() {
     else if ('clientX' in e) { clientX = e.clientX; clientY = e.clientY; }
 
     hapticImpact('light');
-    const newEnergy = Math.max(0, user.energy - 2.5);
+    // FIX: décrément optimiste de 1 (au lieu de 2.5) — cohérent avec le coût réel côté API
+    const newEnergy = Math.max(0, user.energy - 1);
     setUser({ ...user, coin_balance: user.coin_balance + 1, energy: newEnergy, total_taps: user.total_taps + 1 });
     optimisticAddedRef.current += 1;
 
@@ -144,7 +143,6 @@ export default function GamePage() {
         const cu = userRef.current;
         if (cu) {
           setUser({ ...cu, coin_balance: response.newBalance, energy: response.newEnergy, total_taps: response.newTotalTaps ?? cu.total_taps });
-          // Resync le timer apres sync API pour eviter la derive
           lastTickRef.current = Date.now();
         }
         if (response.aiLevelUp) hapticNotification('success');
