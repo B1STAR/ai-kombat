@@ -32,8 +32,18 @@ interface GameState {
   isLoading: boolean;
   error: string | null;
 
+  /**
+   * initDone persiste dans le store Zustand (survit aux démontages React).
+   * Quand GamePage est démonté puis remonté (navigation SPA Section→Accueil),
+   * initDone reste true → /api/auth/init n'est PAS rappelé → l'énergie locale
+   * n'est pas écrasée par la valeur DB figée.
+   * Réinitialisé à false seulement si l'utilisateur est null (déconnexion).
+   */
+  initDone: boolean;
+
   // Actions
   setUser: (user: User | null) => void;
+  setInitDone: (v: boolean) => void;
   setModules: (modules: AiModule[]) => void;
   setQuests: (quests: Quest[]) => void;
   addCoins: (amount: number) => void;
@@ -49,10 +59,12 @@ export const useGameStore = create<GameState>((set) => ({
   quests: [],
   isLoading: false,
   error: null,
+  initDone: false,
 
   // Always normalise the user object so numeric fields are real numbers,
   // regardless of whether Postgres serialised them as strings.
   setUser: (user) => set({ user: user ? normaliseUser(user) : null }),
+  setInitDone: (v) => set({ initDone: v }),
   setModules: (modules) => set({ modules }),
   setQuests: (quests) => set({ quests }),
   addCoins: (amount) => set((state) => ({
