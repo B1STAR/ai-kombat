@@ -21,18 +21,18 @@ const API_URL        = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001
 
 function AiBadge({ level, type }: { level: number; type: string }) {
   const tiers = [
-    { min: 0,   max: 4,   label: 'Novice',  color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '\u{1F9E0}' },
-    { min: 5,   max: 9,   label: 'Initi\u00e9',  color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '\u{1F41E}' },
-    { min: 10,  max: 19,  label: 'Expert',  color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '\u26A1' },
-    { min: 20,  max: 49,  label: 'Master',  color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '\u{1F52E}' },
-    { min: 50,  max: 99,  label: 'Legend',  color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '\u{1F451}' },
-    { min: 100, max: 999, label: 'GOD',     color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '\u{1F525}' },
+    { min: 0,   max: 4,   label: 'Novice',  color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '🧠' },
+    { min: 5,   max: 9,   label: 'Initié',  color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '🐞' },
+    { min: 10,  max: 19,  label: 'Expert',  color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '⚡' },
+    { min: 20,  max: 49,  label: 'Master',  color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '🔮' },
+    { min: 50,  max: 99,  label: 'Legend',  color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '👑' },
+    { min: 100, max: 999, label: 'GOD',     color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '🔥' },
   ];
   const tier = tiers.find(t => level >= t.min && level <= t.max) || tiers[0];
   return (
     <div className="w-11 h-11 rounded-full flex flex-col items-center justify-center border-2 select-none"
       style={{ background: tier.bg, borderColor: tier.color }}
-      title={`AI ${tier.label} \u2014 Level ${level}`}>
+      title={`AI ${tier.label} — Level ${level}`}>
       <span style={{ fontSize: '16px', lineHeight: 1 }}>{tier.emoji}</span>
       <span style={{ fontSize: '8px', fontWeight: 700, color: tier.color, lineHeight: 1.2 }}>Lv.{level}</span>
     </div>
@@ -46,12 +46,15 @@ export default function GamePage() {
 
   const apiRef      = useRef(api);
   const setUserRef  = useRef(setUser);
-  // Fix #1 : capturer initData dans un ref pour l'utiliser dans flushViaKeepalive
-  // (les closures de useEffect ne voient pas les mises à jour de state directement)
   const initDataRef = useRef<string>(initData || '');
   useEffect(() => { apiRef.current      = api;          }, [api]);
   useEffect(() => { setUserRef.current  = setUser;      }, [setUser]);
   useEffect(() => { initDataRef.current = initData || ''; }, [initData]);
+
+  // Fix #3 : guard pour ne pas relancer init si user déjà chargé (remontage SPA).
+  // Seul le premier montage (user===null) déclenche /api/auth/init.
+  // Les remontages suivants (navigation Section→Accueil) ne touchent pas l'énergie.
+  const initDoneRef = useRef(false);
 
   const maxEnergyRef = useRef<number>(1000);
   useEffect(() => { if (user?.max_energy) maxEnergyRef.current = user.max_energy; }, [user?.max_energy]);
@@ -63,15 +66,8 @@ export default function GamePage() {
   const displayTapsRef    = useRef<number>(0);
   const displayEnergyRef  = useRef<number>(0);
 
-  // SOURCE DE VÉRITÉ UNIQUE : timestamp d'épuisement reçu du serveur.
-  // null  = énergie disponible (ou regen terminée).
-  // number = ms epoch du moment où le serveur a confirmé l'épuisement.
-  // Ce ref n'est JAMAIS modifié localement par handleTap.
-  // Il est UNIQUEMENT mis à jour par les réponses /api/tap et /api/auth/init.
   const serverExhaustedAtRef = useRef<number | null>(null);
-
-  // Fix #3 : fallback regen si serverExhaustedAtRef=null mais énergie bloquée à 0
-  const energyZeroSinceRef = useRef<number | null>(null);
+  const energyZeroSinceRef   = useRef<number | null>(null);
 
   const tapPendingRef     = useRef(0);
   const batchTimerRef     = useRef<NodeJS.Timeout>();
@@ -91,10 +87,6 @@ export default function GamePage() {
 
   const [floatingCoins, setFloatingCoins] = useState<FloatingCoin[]>([]);
 
-  // ----------------------------------------------------------------
-  // Helpers : lire/écrire serverExhaustedAtRef + recalculer l'énergie
-  // depuis le timestamp serveur (utilisé à l'init et après chaque réponse).
-  // ----------------------------------------------------------------
   const applyServerExhaustedAt = useCallback((isoOrNull: string | null) => {
     if (!isoOrNull) {
       serverExhaustedAtRef.current = null;
@@ -104,10 +96,6 @@ export default function GamePage() {
     serverExhaustedAtRef.current = ms;
   }, []);
 
-  /**
-   * Recalcule l'énergie locale à partir du timestamp serveur.
-   * Appelé uniquement à l'init (et uniquement si aucun tap n'est en vol).
-   */
   const rebuildEnergyFromServer = useCallback((u: any) => {
     const maxE = u.max_energy || 1000;
     maxEnergyRef.current = maxE;
@@ -115,7 +103,10 @@ export default function GamePage() {
     if (!u.energy_exhausted_at) {
       serverExhaustedAtRef.current = null;
       energyZeroSinceRef.current   = null;
-      displayEnergyRef.current     = Number(u.energy);
+      // Fix #1 côté client : u.energy est maintenant la valeur recalculée
+      // retournée par auth/init (calculateValidEnergy côté serveur).
+      // On l'utilise directement sans recalcul local supplémentaire.
+      displayEnergyRef.current = Number(u.energy);
       setDisplayEnergy(Number(u.energy));
       return;
     }
@@ -127,7 +118,6 @@ export default function GamePage() {
     const regenStartAt = exhaustedMs + REGEN_DELAY_MS;
 
     if (now < regenStartAt) {
-      // Délai 30s pas encore passé
       displayEnergyRef.current = 0;
       setDisplayEnergy(0);
       if (!energyZeroSinceRef.current) energyZeroSinceRef.current = now;
@@ -146,12 +136,19 @@ export default function GamePage() {
   }, []);
 
   // ----------------------------------------------------------------
-  // Init
+  // Init — Fix #3 : guard initDoneRef
+  // Ne se déclenche qu'une seule fois par montage initial (user===null).
+  // Les remontages SPA (navigation Section→Accueil) ne rappellent PAS
+  // /api/auth/init et ne touchent donc pas displayEnergyRef.
   // ----------------------------------------------------------------
   useEffect(() => {
     if (!isReady) return;
     if (isTelegram && !initData) return;
+    // Guard : si init déjà fait ET user déjà chargé, ne pas refaire
+    if (initDoneRef.current && user !== null) return;
+
     const init = async () => {
+      initDoneRef.current = true;
       try {
         const referralCode = startParam?.startsWith('ref_') ? startParam : undefined;
         const response = await apiRef.current.post<{ user: any }>('/api/auth/init', { initData, referralCode });
@@ -161,7 +158,7 @@ export default function GamePage() {
         displayTapsRef.current    = u.total_taps;
         setDisplayBalance(u.coin_balance);
         setDisplayTaps(u.total_taps);
-        // Fix #2 : ne pas écraser l'énergie locale si des taps sont encore en vol
+        // Appliquer l'énergie serveur seulement si aucun tap en vol
         if (tapPendingRef.current === 0 && batchInFlightRef.current === null) {
           rebuildEnergyFromServer(u);
         }
@@ -186,11 +183,10 @@ export default function GamePage() {
       }
     };
     init();
-  }, [isReady, initData, rebuildEnergyFromServer]);
+  }, [isReady, initData, rebuildEnergyFromServer, user]);
 
   // ----------------------------------------------------------------
   // Fix #1 — Flush avant quitter la page via fetch keepalive
-  // (sendBeacon ne peut pas transporter l'Authorization header)
   // ----------------------------------------------------------------
   const flushViaKeepalive = useCallback(() => {
     if (tapPendingRef.current === 0) return;
@@ -219,7 +215,6 @@ export default function GamePage() {
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
-        // Flush keepalive (survit à la navigation, transporte les headers auth)
         flushViaKeepalive();
         clearTimeout(batchTimerRef.current);
       }
@@ -230,7 +225,6 @@ export default function GamePage() {
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       clearTimeout(batchTimerRef.current);
-      // Flush au démontage SPA si taps en attente
       if (tapPendingRef.current > 0) {
         flushBatchRef.current?.();
       }
@@ -239,7 +233,6 @@ export default function GamePage() {
 
   // ----------------------------------------------------------------
   // Timer regen — tic toutes les 500ms
-  // Fix #3 : fallback si serverExhaustedAtRef=null et énergie bloquée à 0 > 35s
   // ----------------------------------------------------------------
   const lastTickRef = useRef<number>(Date.now());
 
@@ -260,11 +253,8 @@ export default function GamePage() {
 
       if (cur <= 0) {
         if (exhaustedAt !== null) {
-          // Timestamp serveur connu : respecter le délai 30s
           if (now - exhaustedAt < REGEN_DELAY_MS) return;
         } else {
-          // Fix #3 : pas de timestamp serveur (keepalive peut avoir échoué)
-          // → démarrer quand même la regen après 35s d'énergie à 0
           if (!energyZeroSinceRef.current) {
             energyZeroSinceRef.current = now;
             return;
@@ -321,19 +311,17 @@ export default function GamePage() {
           durationMs,
         });
 
-        // ── Sync balance & taps ──────────────────────────────────────────────
         const pendingAfter = tapPendingRef.current;
         displayBalanceRef.current = response.newBalance   + pendingAfter;
         displayTapsRef.current    = response.newTotalTaps + pendingAfter;
         setDisplayBalance(response.newBalance   + pendingAfter);
         setDisplayTaps(response.newTotalTaps    + pendingAfter);
 
-        // ── Sync énergie depuis le serveur (SOURCE DE VÉRITÉ) ────────────────
         applyServerExhaustedAt(response.energyExhaustedAt ?? null);
 
         if (response.newEnergy <= 0) {
           displayEnergyRef.current   = 0;
-          energyZeroSinceRef.current = null; // timestamp serveur fait foi
+          energyZeroSinceRef.current = null;
           setDisplayEnergy(0);
         } else {
           energyZeroSinceRef.current = null;
@@ -416,7 +404,7 @@ export default function GamePage() {
     : 'from-red-700 to-red-500';
 
   const isExhausted = Math.floor(displayEnergy) < 1;
-  const regenLabel  = isExhausted ? 'Recharge en cours\u2026' : 'Tap to train';
+  const regenLabel  = isExhausted ? 'Recharge en cours…' : 'Tap to train';
   const regenSub    = isExhausted ? '' : '+1 coin par tap';
 
   return (

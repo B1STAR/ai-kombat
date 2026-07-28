@@ -108,17 +108,25 @@ tap.post(
 
     // ── 4. UPDATE ATOMIQUE ───────────────────────────────────────────────────
     const updatePayload: Record<string, any> = {
-      energy             : newEnergy,
-      total_taps         : db.raw('total_taps + ?',         [count]),
-      coin_balance       : db.raw('coin_balance + ?',       [coinsEarned]),
-      total_earned_coins : db.raw('total_earned_coins + ?', [coinsEarned]),
-      energy_exhausted_at: isExhausted ? new Date() : null,
+      energy       : newEnergy,
+      total_taps   : db.raw('total_taps + ?',         [count]),
+      coin_balance  : db.raw('coin_balance + ?',       [coinsEarned]),
+      total_earned_coins: db.raw('total_earned_coins + ?', [coinsEarned]),
     };
 
-    // Mise à jour last_energy_update uniquement en sortie de regen
-    if (dbUser.energy_exhausted_at && !isExhausted) {
-      updatePayload.last_energy_update = new Date();
+    // Fix #2 : energy_exhausted_at n'est modifié QUE dans 2 cas :
+    //   a) On vient d'épuiser l'énergie → on pose le timestamp
+    //   b) On sort d'un épuisement (était non-null, maintenant newEnergy > 0) → on remet à null
+    // En dehors de ces 2 cas (tap normal, energy_exhausted_at déjà null) on ne touche PAS
+    // energy_exhausted_at pour éviter d'écraser un timestamp posé par un batch concurrent.
+    if (isExhausted) {
+      updatePayload.energy_exhausted_at = new Date();
+    } else if (dbUser.energy_exhausted_at) {
+      // Sortie d'épuisement : on efface le timestamp et on note le moment de sortie
+      updatePayload.energy_exhausted_at = null;
+      updatePayload.last_energy_update  = new Date();
     }
+    // Cas normal (pas épuisé, pas en sortie d'épuisement) : on ne touche pas energy_exhausted_at
 
     const updatedRows = await db('users')
       .where({ telegram_id: user.id })
@@ -158,8 +166,6 @@ tap.post(
     const { leveledUp, newLevel } = await addXp(user.id, xpGained);
 
     // ── 5. RÉPONSE : inclut toujours energyExhaustedAt ───────────────────────
-    // Le client utilise ce timestamp comme source de vérité pour la regen.
-    // null = énergie disponible. ISO string = épuisé, regen démarre 30s après.
     return c.json({
       coinsEarned,
       xpGained,

@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { validate, parse } from '@telegram-apps/init-data-node';
 import { env } from '../lib/env';
 import { db } from '../db/knex';
-import { upsertUser, getUserProgress, getUserByTelegramId, toUserDTO } from '../services/user.service';
+import { upsertUser, getUserProgress, getUserByTelegramId, toUserDTO, calculateValidEnergy, normalizeUser } from '../services/user.service';
 import { getPassiveIncomePerHour } from '../services/economy.service';
 import { logger } from '../lib/logger';
 
@@ -149,10 +149,22 @@ auth.post('/init', zValidator('json', initSchema), async (c) => {
     getUserByTelegramId(newUserId),
   ]);
 
-  const safeUser = toUserDTO(freshUser ?? user);
+  const baseUser = freshUser ?? user;
+  const normalizedBase = normalizeUser(baseUser);
+
+  // Fix #1 : retourner l'énergie recalculée (regen depuis energy_exhausted_at)
+  // au lieu de user.energy brut. Sans ce fix, le frontend recevait la valeur
+  // DB figée (ex: 200) et rebuildEnergyFromServer écrasait l'affichage en cours.
+  const computedEnergy = calculateValidEnergy(normalizedBase);
+
+  const safeUser = toUserDTO(normalizedBase);
 
   return c.json({
-    user: { ...safeUser, passiveIncomePerHour: passiveIncome },
+    user: {
+      ...safeUser,
+      energy: computedEnergy,
+      passiveIncomePerHour: passiveIncome,
+    },
     ...progress,
   });
 });
