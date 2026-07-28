@@ -5,6 +5,10 @@
  * Le serveur est la SOURCE DE VÉRITÉ unique pour energy_exhausted_at.
  * La réponse JSON inclut toujours energyExhaustedAt (ISO string ou null).
  * Le client n'a jamais à deviner ni maintenir cet état localement.
+ *
+ * FIX last_active_at : on met à jour last_active_at à chaque tap pour que
+ * auth/init puisse retourner skipEnergySync=true dans les 10 s qui suivent
+ * un tap et éviter d'écraser l'énergie locale optimiste du frontend.
  */
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
@@ -108,13 +112,21 @@ tap.post(
 
     // ── 4. UPDATE ATOMIQUE ───────────────────────────────────────────────────
     const updatePayload: Record<string, any> = {
-      energy       : newEnergy,
-      total_taps   : db.raw('total_taps + ?',         [count]),
-      coin_balance  : db.raw('coin_balance + ?',       [coinsEarned]),
-      total_earned_coins: db.raw('total_earned_coins + ?', [coinsEarned]),
+      energy            : newEnergy,
+      total_taps        : db.raw('total_taps + ?',          [count]),
+      coin_balance      : db.raw('coin_balance + ?',        [coinsEarned]),
+      total_earned_coins: db.raw('total_earned_coins + ?',  [coinsEarned]),
+      /**
+       * FIX last_active_at :
+       * Mis à jour à chaque tap pour que auth/init puisse calculer
+       * skipEnergySync=true dans les 10 secondes qui suivent le dernier tap.
+       * Sans ce champ mis à jour, auth/init retournait toujours skipEnergySync=false
+       * et écrasait l'énergie locale optimiste du client.
+       */
+      last_active_at    : db.fn.now(),
     };
 
-    // Fix #2 : energy_exhausted_at n'est modifié QUE dans 2 cas :
+    // energy_exhausted_at n'est modifié QUE dans 2 cas :
     //   a) On vient d'épuiser l'énergie → on pose le timestamp
     //   b) On sort d'un épuisement (était non-null, maintenant newEnergy > 0) → on remet à null
     // En dehors de ces 2 cas (tap normal, energy_exhausted_at déjà null) on ne touche PAS
@@ -138,6 +150,7 @@ tap.post(
         'max_energy',
         'ai_level',
         'energy_exhausted_at',
+        'last_active_at',
       ]);
 
     if (!updatedRows || updatedRows.length === 0) {
