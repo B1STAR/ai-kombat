@@ -21,18 +21,18 @@ const API_URL        = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001
 
 function AiBadge({ level, type }: { level: number; type: string }) {
   const tiers = [
-    { min: 0,   max: 4,   label: 'Novice',  color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '🧠' },
-    { min: 5,   max: 9,   label: 'Initié',  color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '🐞' },
-    { min: 10,  max: 19,  label: 'Expert',  color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '⚡' },
-    { min: 20,  max: 49,  label: 'Master',  color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '🔮' },
-    { min: 50,  max: 99,  label: 'Legend',  color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '👑' },
-    { min: 100, max: 999, label: 'GOD',     color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '🔥' },
+    { min: 0,   max: 4,   label: 'Novice',  color: '#6366f1', bg: 'rgba(99,102,241,0.18)',  emoji: '\ud83e\udde0' },
+    { min: 5,   max: 9,   label: 'Initi\u00e9',  color: '#06b6d4', bg: 'rgba(6,182,212,0.18)',   emoji: '\ud83d\udc1e' },
+    { min: 10,  max: 19,  label: 'Expert',  color: '#f59e0b', bg: 'rgba(245,158,11,0.18)',  emoji: '\u26a1' },
+    { min: 20,  max: 49,  label: 'Master',  color: '#8b5cf6', bg: 'rgba(139,92,246,0.18)',  emoji: '\ud83d\udd2e' },
+    { min: 50,  max: 99,  label: 'Legend',  color: '#ec4899', bg: 'rgba(236,72,153,0.18)',  emoji: '\ud83d\udc51' },
+    { min: 100, max: 999, label: 'GOD',     color: '#ef4444', bg: 'rgba(239,68,68,0.18)',   emoji: '\ud83d\udd25' },
   ];
   const tier = tiers.find(t => level >= t.min && level <= t.max) || tiers[0];
   return (
     <div className="w-11 h-11 rounded-full flex flex-col items-center justify-center border-2 select-none"
       style={{ background: tier.bg, borderColor: tier.color }}
-      title={`AI ${tier.label} — Level ${level}`}>
+      title={`AI ${tier.label} \u2014 Level ${level}`}>
       <span style={{ fontSize: '16px', lineHeight: 1 }}>{tier.emoji}</span>
       <span style={{ fontSize: '8px', fontWeight: 700, color: tier.color, lineHeight: 1.2 }}>Lv.{level}</span>
     </div>
@@ -42,7 +42,15 @@ function AiBadge({ level, type }: { level: number; type: string }) {
 export default function GamePage() {
   const api = useApi();
   const { isTelegram, initData, startParam, isReady } = useTelegram();
-  const { user, setUser } = useGameStore();
+
+  /**
+   * FIX PRINCIPAL — initDone est d\u00e9sormais dans le store Zustand.
+   * useRef(false) ne survivait pas aux d\u00e9montages React (navigation SPA) :
+   * chaque remontage de GamePage r\u00e9initialisait initDoneRef \u00e0 false et
+   * relancait /api/auth/init, \u00e9crasant l'\u00e9nergie/coins/taps locaux.
+   * En stockant initDone dans Zustand il persiste entre tous les remontages.
+   */
+  const { user, setUser, initDone, setInitDone } = useGameStore();
 
   const apiRef      = useRef(api);
   const setUserRef  = useRef(setUser);
@@ -50,11 +58,6 @@ export default function GamePage() {
   useEffect(() => { apiRef.current      = api;          }, [api]);
   useEffect(() => { setUserRef.current  = setUser;      }, [setUser]);
   useEffect(() => { initDataRef.current = initData || ''; }, [initData]);
-
-  // Fix #3 : guard pour ne pas relancer init si user déjà chargé (remontage SPA).
-  // Seul le premier montage (user===null) déclenche /api/auth/init.
-  // Les remontages suivants (navigation Section→Accueil) ne touchent pas l'énergie.
-  const initDoneRef = useRef(false);
 
   const maxEnergyRef = useRef<number>(1000);
   useEffect(() => { if (user?.max_energy) maxEnergyRef.current = user.max_energy; }, [user?.max_energy]);
@@ -75,6 +78,8 @@ export default function GamePage() {
   const batchStartTimeRef = useRef<number>(0);
   const batchSentAtRef    = useRef<number>(0);
 
+  // Ne synchroniser balance/taps depuis le store QUE si aucun tap local en attente.
+  // Evite que le re-rendu du store (apr\u00e8s auth/init) n'\u00e9crase les valeurs optimistes.
   useEffect(() => {
     if (!user) return;
     if (tapPendingRef.current === 0 && batchInFlightRef.current === null) {
@@ -103,9 +108,6 @@ export default function GamePage() {
     if (!u.energy_exhausted_at) {
       serverExhaustedAtRef.current = null;
       energyZeroSinceRef.current   = null;
-      // Fix #1 côté client : u.energy est maintenant la valeur recalculée
-      // retournée par auth/init (calculateValidEnergy côté serveur).
-      // On l'utilise directement sans recalcul local supplémentaire.
       displayEnergyRef.current = Number(u.energy);
       setDisplayEnergy(Number(u.energy));
       return;
@@ -136,30 +138,42 @@ export default function GamePage() {
   }, []);
 
   // ----------------------------------------------------------------
-  // Init — Fix #3 : guard initDoneRef
-  // Ne se déclenche qu'une seule fois par montage initial (user===null).
-  // Les remontages SPA (navigation Section→Accueil) ne rappellent PAS
-  // /api/auth/init et ne touchent donc pas displayEnergyRef.
+  // Init — Guard via store Zustand (survit aux d\u00e9montages SPA)
+  //
+  // Comportement :
+  //   - Premier montage (initDone=false, user=null) : appelle /api/auth/init
+  //   - Remontages SPA (initDone=true, user!=null)  : skip complet, aucun
+  //     \u00e9crasement de l'\u00e9nergie/coins/taps locaux
+  //   - skipEnergySync=true (activit\u00e9 r\u00e9cente < 10s) : applique les
+  //     donn\u00e9es utilisateur mais pr\u00e9serve l'\u00e9nergie locale optimiste
   // ----------------------------------------------------------------
   useEffect(() => {
     if (!isReady) return;
     if (isTelegram && !initData) return;
-    // Guard : si init déjà fait ET user déjà chargé, ne pas refaire
-    if (initDoneRef.current && user !== null) return;
+    // Guard store : si init d\u00e9j\u00e0 fait ET user charg\u00e9, skip total
+    if (initDone && user !== null) return;
 
     const init = async () => {
-      initDoneRef.current = true;
+      setInitDone(true);
       try {
         const referralCode = startParam?.startsWith('ref_') ? startParam : undefined;
         const response = await apiRef.current.post<{ user: any }>('/api/auth/init', { initData, referralCode });
         const u = response.user;
         setUserRef.current(u);
-        displayBalanceRef.current = u.coin_balance;
-        displayTapsRef.current    = u.total_taps;
-        setDisplayBalance(u.coin_balance);
-        setDisplayTaps(u.total_taps);
-        // Appliquer l'énergie serveur seulement si aucun tap en vol
+        // Balance et taps : synchroniser seulement si aucun tap en vol
         if (tapPendingRef.current === 0 && batchInFlightRef.current === null) {
+          displayBalanceRef.current = u.coin_balance;
+          displayTapsRef.current    = u.total_taps;
+          setDisplayBalance(u.coin_balance);
+          setDisplayTaps(u.total_taps);
+        }
+        /**
+         * skipEnergySync — le serveur signale une activit\u00e9 r\u00e9cente (< 10s).
+         * La valeur energy en DB est potentiellement en retard sur l'affichage
+         * local (batch encore en vol ou venant d'\u00eatre re\u00e7u).
+         * On NE touche PAS displayEnergy pour ne pas perdre les gains optimistes.
+         */
+        if (!u.skipEnergySync && tapPendingRef.current === 0 && batchInFlightRef.current === null) {
           rebuildEnergyFromServer(u);
         }
       } catch {
@@ -172,6 +186,7 @@ export default function GamePage() {
             referred_by: null, referral_count: 0, daily_streak: 0, is_banned: false,
             passiveIncomePerHour: 0,
             energy_exhausted_at: null, last_energy_update: new Date().toISOString(),
+            skipEnergySync: false,
           };
           setUserRef.current(devUser);
           displayBalanceRef.current = 0;
@@ -183,10 +198,10 @@ export default function GamePage() {
       }
     };
     init();
-  }, [isReady, initData, rebuildEnergyFromServer, user]);
+  }, [isReady, initData, rebuildEnergyFromServer, initDone, setInitDone, user]);
 
   // ----------------------------------------------------------------
-  // Fix #1 — Flush avant quitter la page via fetch keepalive
+  // Flush avant quitter la page via fetch keepalive
   // ----------------------------------------------------------------
   const flushViaKeepalive = useCallback(() => {
     if (tapPendingRef.current === 0) return;
@@ -225,8 +240,10 @@ export default function GamePage() {
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       clearTimeout(batchTimerRef.current);
+      // Flush garanti au d\u00e9montage (navigation SPA) : keepalive assure la livraison
+      // m\u00eame si le composant est d\u00e9mont\u00e9 avant la r\u00e9ponse serveur.
       if (tapPendingRef.current > 0) {
-        flushBatchRef.current?.();
+        flushViaKeepalive();
       }
     };
   }, [flushViaKeepalive]);
@@ -404,7 +421,7 @@ export default function GamePage() {
     : 'from-red-700 to-red-500';
 
   const isExhausted = Math.floor(displayEnergy) < 1;
-  const regenLabel  = isExhausted ? 'Recharge en cours…' : 'Tap to train';
+  const regenLabel  = isExhausted ? 'Recharge en cours\u2026' : 'Tap to train';
   const regenSub    = isExhausted ? '' : '+1 coin par tap';
 
   return (
@@ -439,7 +456,7 @@ export default function GamePage() {
       <div className="flex justify-center items-center gap-3 pt-1 pb-3">
         <div className="w-10 h-10 rounded-full flex items-center justify-center"
           style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)', boxShadow: '0 0 16px rgba(245,158,11,0.35)' }}>
-          <span className="text-lg">🪙</span>
+          <span className="text-lg">\ud83e\ude99</span>
         </div>
         <span className="text-4xl font-extrabold text-white tracking-tight">{fmt(displayBalance)}</span>
       </div>
@@ -465,7 +482,7 @@ export default function GamePage() {
       <div className="px-4 mb-4">
         <div className="flex items-center justify-between mb-1.5">
           <div className="flex items-center gap-1.5">
-            <span className="text-sm">⚡</span>
+            <span className="text-sm">\u26a1</span>
             <span className="text-sm font-semibold text-white">{Math.floor(displayEnergy)}</span>
             <span className="text-xs text-slate-500">/ {maxEnergy}</span>
           </div>
