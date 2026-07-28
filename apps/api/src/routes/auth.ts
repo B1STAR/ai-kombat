@@ -159,11 +159,29 @@ auth.post('/init', zValidator('json', initSchema), async (c) => {
 
   const safeUser = toUserDTO(normalizedBase);
 
+  /**
+   * skipEnergySync — Flag anti-écrasement énergie optimiste.
+   *
+   * Si last_active_at < 10s, l'utilisateur vient de taper. Son batch
+   * est peut-être encore en vol ou vient d'être reçu. La valeur `energy`
+   * en DB peut donc être légèrement en retard sur l'affichage local.
+   * On retourne skipEnergySync=true pour que le client ignore la mise
+   * à jour d'énergie et conserve sa valeur locale optimiste.
+   *
+   * Cas non concernés : premier chargement, reconnexion après longue absence.
+   * Dans ces cas last_active_at est > 10s → skipEnergySync=false → sync normale.
+   */
+  const lastActiveMs = normalizedBase.last_active_at
+    ? new Date(normalizedBase.last_active_at).getTime()
+    : 0;
+  const skipEnergySync = Date.now() - lastActiveMs < 10_000;
+
   return c.json({
     user: {
       ...safeUser,
       energy: computedEnergy,
       passiveIncomePerHour: passiveIncome,
+      skipEnergySync,
     },
     ...progress,
   });
